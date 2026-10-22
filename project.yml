@@ -13,6 +13,22 @@ targets:
   QuizApp:
     type: application
     platform: iOS
+    # Info.plist 必须显式声明让 XcodeGen 生成：2026-10-23 云端编译栽过一次——
+    # 没这段时打出的 App 包里没有 Info.plist，最后校验一步直接失败
+    info:
+      path: QuizApp/Info.plist
+      properties:
+        CFBundleDisplayName: 刷题
+        UILaunchStoryboardName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     dependencies:
       - package: ZIPFoundation
     sources:
