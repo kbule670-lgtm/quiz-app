@@ -1,0 +1,49 @@
+name: 编译未签名ipa
+
+# 触发方式：手动点 Run workflow，或者推送代码到 main 分支自动跑
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    # GitHub 云端 Mac（macos-26 自带 Xcode 26）
+    # 必须用 Xcode 26 编译，刷题 App 的液态玻璃效果才生效；
+    # 老镜像 macos-14 只有 Xcode 15、编不出玻璃效果，而且 2026-11 就停用了
+    runs-on: macos-26
+    steps:
+      - name: 拉代码
+        uses: actions/checkout@v4
+
+      - name: 装 XcodeGen（用它从 project.yml 生成 Xcode 工程）
+        run: brew install xcodegen
+
+      - name: 生成工程
+        run: xcodegen generate
+
+      - name: 编译（不签名）
+        run: |
+          xcodebuild \
+            -project QuizApp.xcodeproj \
+            -scheme QuizApp \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打成未签名 ipa
+        run: |
+          mkdir -p Payload
+          cp -r "build/Build/Products/Release-iphoneos/QuizApp.app" Payload/
+          zip -r QuizApp-unsigned.ipa Payload
+          ls -lh QuizApp-unsigned.ipa
+
+      - name: 上传 ipa（在本次运行页面底部 Artifacts 下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuizApp-unsigned-ipa
+          path: QuizApp-unsigned.ipa
