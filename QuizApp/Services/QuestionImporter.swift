@@ -63,7 +63,7 @@ enum QuestionImporter {
     }
 
     // 统一校验：题干非空、4 个非空选项、答案是 A-D 之一
-    private static func dto(stem: String, options: [String], answerLetter: String,
+    static func dto(stem: String, options: [String], answerLetter: String,
                             explanation: String, line: Int) throws -> QuestionDTO {
         let s = stem.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else {
@@ -78,6 +78,84 @@ enum QuestionImporter {
             throw ImportError.badFormat("第 \(line) 行答案必须是 A/B/C/D，写的是「\(answerLetter)」")
         }
         return QuestionDTO(stem: s, options: opts, answerIndex: idx, explanation: explanation)
+    }
+
+    // 文字版题库：PDF / Word / txt 里提取出的文字都走这个解析器。认这种最常见的排版：
+    // 1. 题干（可以占好几行）
+    // A. 选项一  B. 选项二      （选项一行一个、或几个挤一行，都行）
+    // C. 选项三
+    // D. 选项四
+    // 答案：B
+    // 解析：可有可无
+    // 答案也可以写成题干末尾的（B）这种形式。
+    static func fromFormattedText(_ text: String) throws -> [QuestionDTO] {
+        let ns = text as NSString
+        // 按"行首的题号"切块
+        let startRe = try NSRegularExpression(pattern: #"(?m)^[ \t]*\d{1,4}[ \t]*[.、．)）][ \t]*"#)
+        let starts = startRe.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        guard !starts.isEmpty else {
+            throw ImportError.badFormat("没找到题号（一行一道、题号开头的格式），看看填写说明里的文字版模板")
+        }
+        var dtos: [QuestionDTO] = []
+        for (bi, m) in starts.enumerated() {
+            let from = m.range.upperBound
+            let to = bi + 1 < starts.count ? starts[bi + 1].range.location : ns.length
+            var block = ns.substring(with: NSRange(location: from, length: to - from))
+
+            // 先抠答案：答案：B / 【答案】B
+            var answerLetter: String?
+            if let am = firstMatch(#"(?:【)?(?:答案|正确答案)(?:】)?[ \t]*[:：]?[ \t]*([ABCD])"#, in: block) {
+                answerLetter = (block as NSString).substring(with: am.range(at: 1))
+                block = replace(block, range: am.range, with: "")
+            }
+            // 再抠解析：解析：……一直到这道题结束
+            var explanation = ""
+            if let em = firstMatch(#"(?:解析|答案解析|试题解析)[ \t]*[:：]"#, in: block) {
+                let s = (em.range.location + em.range.length)
+                explanation = ((block as NSString).substring(from: s))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                block = (block as NSString).substring(to: em.range.location)
+            }
+            // 答案没单独写的话，认题干/选项里括号包着的：（B）
+            if answerLetter == nil,
+               let am = firstMatch(#"[(（][ \t]*([ABCD])[ \t]*[)）]"#, in: block) {
+                answerLetter = (block as NSString).substring(with: am.range(at: 1))
+                block = replace(block, range: am.range, with: "")
+            }
+            guard let ans = answerLetter else {
+                throw ImportError.badFormat("第 \(bi + 1) 题没找到答案（要写「答案：B」或在题干后标（B））")
+            }
+            // 抠选项：找 A. B. C. D. 四个标记，标记之间就是选项内容
+            let optRe = try NSRegularExpression(pattern: #"([ABCD])[ \t]*[.、．:：]"#)
+            let bns = block as NSString
+            let opts = optRe.matches(in: block, range: NSRange(location: 0, length: bns.length))
+            guard opts.count == 4,
+                  (0..<4).allSatisfy({ bns.substring(with: opts[$0].range(at: 1)) == ["A", "B", "C", "D"][$0] })
+            else {
+                throw ImportError.badFormat("第 \(bi + 1) 题没凑齐 A、B、C、D 四个选项")
+            }
+            let stem = bns.substring(to: opts[0].range.location)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var options: [String] = []
+            for i in 0..<4 {
+                let s = opts[i].range.upperBound
+                let e = i + 1 < 4 ? opts[i + 1].range.location : bns.length
+                options.append(bns.substring(with: NSRange(location: s, length: e - s))
+                    .trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            dtos.append(try dto(stem: stem, options: options, answerLetter: ans,
+                                explanation: explanation, line: bi + 1))
+        }
+        return dtos
+    }
+
+    private static func firstMatch(_ pattern: String, in text: String) -> NSTextCheckingResult? {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        return re.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length))
+    }
+
+    private static func replace(_ text: String, range: NSRange, with: String) -> String {
+        (text as NSString).replacingCharacters(in: range, with: with)
     }
 
     // 最小可用 CSV 解析：认双引号包裹，逗号/换行在引号里不算分隔符
