@@ -7,7 +7,7 @@ private struct Notice: Identifiable {
     let text: String
 }
 
-// 题库页：导入（JSON/CSV 文件）/ 示例题 / 导出 / 清空
+// 题库页：导入（JSON/CSV/PDF/Word/txt 文件）/ 示例题 / 导出 / 清空
 struct ImportView: View {
     @Environment(\.modelContext) private var context
     @Query(sort: \Question.stem) private var questions: [Question]
@@ -23,7 +23,7 @@ struct ImportView: View {
         NavigationStack {
             List {
                 Section("导入") {
-                    Button("从文件导入题库（JSON / CSV）") { showImporter = true }
+                    Button("从文件导入题库（PDF / Word / JSON / CSV / txt）") { showImporter = true }
                     Button("载入内置示例题") { loadSample() }
                 }
                 Section("题库（\(questions.count) 道）") {
@@ -48,7 +48,8 @@ struct ImportView: View {
             .navigationTitle("题库")
             .fileImporter(
                 isPresented: $showImporter,
-                allowedContentTypes: [.json, .commaSeparatedText]
+                allowedContentTypes: [.json, .commaSeparatedText, .pdf, .plainText,
+                                      UTType("org.openxmlformats.wordprocessingml.document") ?? .data]
             ) { result in
                 handleImport(result)
             }
@@ -76,10 +77,21 @@ struct ImportView: View {
             }
             defer { url.stopAccessingSecurityScopedResource() }
             let dtos: [QuestionDTO]
-            if url.pathExtension.lowercased() == "csv" {
+            let ext = url.pathExtension.lowercased()
+            switch ext {
+            case "csv":
                 let text = try String(contentsOf: url, encoding: .utf8)
                 dtos = try QuestionImporter.fromCSV(text)
-            } else {
+            case "pdf":
+                dtos = try DocumentImporter.fromPDF(try Data(contentsOf: url))
+            case "docx":
+                dtos = try DocumentImporter.fromDocx(try Data(contentsOf: url))
+            case "doc":
+                say("老版 .doc 读不了，在 Word/WPS 里另存为 .docx 再导一次"); return
+            case "txt":
+                let text = try String(contentsOf: url, encoding: .utf8)
+                dtos = try QuestionImporter.fromFormattedText(text)
+            default:
                 let data = try Data(contentsOf: url)
                 dtos = try QuestionImporter.fromJSON(data)
             }

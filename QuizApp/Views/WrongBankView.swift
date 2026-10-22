@@ -24,7 +24,7 @@ struct WrongBankView: View {
                         Button("重做错题本（\(wrong.count) 道，随机顺序）") {
                             startQuiz(wrong, true)
                         }
-                        .buttonStyle(.borderedProminent)
+                        .primaryGlassButton()
                     }
                     Section("错题列表") {
                         ForEach(wrong) { q in

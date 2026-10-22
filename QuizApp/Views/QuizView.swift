@@ -41,7 +41,7 @@ struct QuizView: View {
                     .foregroundStyle(.secondary)
             }
             Button("再来一轮") { session.restart() }
-                .buttonStyle(.borderedProminent)
+                .primaryGlassButton()
             Button("退出") {
                 try? context.save()
                 dismiss()
@@ -68,8 +68,8 @@ struct QuizView: View {
                         }
                         .padding()
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(optionColor(i, q: q))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .modifier(OptionSurface(color: optionColor(i, q: q),
+                                                answered: session.answered))
                     }
                     .disabled(session.answered)
                     .foregroundStyle(.primary)
@@ -89,7 +89,7 @@ struct QuizView: View {
                     Button(session.cursor + 1 < session.total ? "下一题" : "看成绩") {
                         session.next()
                     }
-                    .buttonStyle(.borderedProminent)
+                    .primaryGlassButton()
                 }
             }
             .padding()

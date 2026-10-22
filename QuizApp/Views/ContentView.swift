@@ -42,7 +42,7 @@ struct ContentView: View {
                     Button("开始刷题（\(pool.count) 道）") {
                         startQuiz(pool, shuffle: shuffle)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .primaryGlassButton()
                     .controlSize(.large)
                     .disabled(pool.isEmpty)
                     Text("题库共 \(questions.count) 道")
