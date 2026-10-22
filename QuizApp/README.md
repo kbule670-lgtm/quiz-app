@@ -26,7 +26,7 @@
 - `Models/Question.swift` — 一道题的数据模型：题干/4选项/答案/解析 + 刷题统计；
   错题本 = "答错过、还没连续答对 N 次"的题。`requiredStreak` 改 1→2 就是"对两次才移出"
 - `Services/QuestionImporter.swift` — 题库导入：JSON、CSV、文字版三种解析，答案写 A/B/C/D；文字版认题号+A-D选项+「答案：B」
-- `Services/DocumentImporter.swift` — 从 PDF（PDFKit）/ .docx（系统读取）里提取文字，再走文字版解析；扫描版 PDF、老版 .doc 会明确报错
+- `Services/DocumentImporter.swift` — 从 PDF（PDFKit）/ .docx（解 zip 取 document.xml 剥标签，靠 ZIPFoundation）里提取文字，再走文字版解析；扫描版 PDF、老版 .doc 会明确报错
 - `Services/SampleBank.swift` — 内置 5 道示例题，跑通流程后可删
 - `ViewModels/QuizSession.swift` — 一次刷题会话：顺序/随机、判分、写统计
 - `Views/ContentView.swift` — 首页三 Tab：刷题 / 错题本 / 题库
