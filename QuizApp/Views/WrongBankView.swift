@@ -1,7 +1,7 @@
 import SwiftUI
 import SwiftData
 
-// 错题本：列表 + 一键重做；做对一次（requiredStreak）就自动移出
+// 错题本：列表 + 一键重做；在这里做对 2 次（requiredStreak）才移出——她的规矩
 struct WrongBankView: View {
     @Query private var questions: [Question]
     var startQuiz: ([Question], Bool) -> Void
@@ -15,7 +15,7 @@ struct WrongBankView: View {
                 ContentUnavailableView(
                     "错题本是空的",
                     systemImage: "checkmark.circle",
-                    description: Text("答错的题会自动进来，重做到对就移出")
+                    description: Text("答错的题会自动进来，在这里做对 2 次才移出")
                 )
                 .navigationTitle("错题本")
             } else {
@@ -30,7 +30,7 @@ struct WrongBankView: View {
                         ForEach(wrong) { q in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(q.stem).lineLimit(2)
-                                Text("累计错 \(q.wrongCount) 次 · 正确答案 \(letters[q.answerIndex])")
+                                Text("累计错 \(q.wrongCount) 次 · 正确答案 \(q.correctAnswerText) · 已做对 \(q.masterStreak)/\(Question.requiredStreak) 次")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
