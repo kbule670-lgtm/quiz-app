@@ -103,11 +103,11 @@ enum AIParseService {
         let blocks = QuestionImporter.splitBlocks(text)
         var chunks: [String] = []
         if blocks.isEmpty {
-            var rest = text[...]
+            var rest = text
             while !rest.isEmpty {
                 let part = rest.prefix(3000)
                 chunks.append(String(part))
-                rest = rest.dropFirst(part.count)
+                rest = String(rest.dropFirst(part.count))
             }
         } else {
             let per = 8
@@ -233,9 +233,12 @@ enum AIParseService {
         var answer = raw.answer.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         let type = (raw.type ?? "").lowercased()
         // 判断题答案要是写成文字（正确/错误）而不是字母，翻译一下
-        if type == "judge" && answer.isEmpty || (type == "judge" && !answer.allSatisfy({ "ABCDE".contains($0) })) {
-            if answer.contains("正确") || answer == "对" || answer == "√" { answer = "A" }
-            else if answer.contains("错误") || answer == "错" || answer == "×" { answer = "B" }
+        if type == "judge" {
+            let isLetters = !answer.isEmpty && answer.allSatisfy { "ABCDE".contains($0) }
+            if !isLetters {
+                if answer.contains("正确") || answer == "对" || answer == "√" { answer = "A" }
+                else if answer.contains("错误") || answer == "错" || answer == "×" { answer = "B" }
+            }
         }
         let letters = Array(Set(answer.filter { "ABCDE".contains($0) })).sorted().map { String($0) }
         let explanation = raw.explanation ?? ""
