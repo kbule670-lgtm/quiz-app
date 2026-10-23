@@ -86,7 +86,12 @@ struct ImportView: View {
                     }
                 }
                 importStatus = nil
-                guard !result.dtos.isEmpty else { say("文件里没有读到题目"); return }
+                guard !result.dtos.isEmpty else {
+                    var msg = "文件里没有读到题目"
+                    if !result.debug.isEmpty { msg += "\n" + result.debug }
+                    say(msg)
+                    return
+                }
                 insert(result.dtos, deckName: deckName)
                 var msg = "导入成功：\(result.dtos.count) 道题"
                 if result.skipped > 0 {
@@ -101,9 +106,10 @@ struct ImportView: View {
     }
 
     // 实际读文件+解析，PDF 图片版会在里面逐页识别（慢，所以放后台跑）
+    // debug 是失败时给用户看的诊断（切出几个题块、识别文字长什么样）
     private static func loadDTOs(from url: URL,
                                  progress: @escaping (Int, Int) -> Void) async throws
-        -> (dtos: [QuestionDTO], skipped: Int) {
+        -> (dtos: [QuestionDTO], skipped: Int, debug: String) {
         // asCopy 复制来的文件在临时目录，一般不用权限；保险起见试一下，有就用完释放
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -111,21 +117,27 @@ struct ImportView: View {
         switch ext {
         case "csv":
             let text = try String(contentsOf: url, encoding: .utf8)
-            return (try QuestionImporter.fromCSV(text), 0)
+            return (try QuestionImporter.fromCSV(text), 0, "")
         case "pdf":
-            return try await DocumentImporter.fromPDF(try Data(contentsOf: url),
-                                                      progress: progress)
+            let r = try await DocumentImporter.fromPDF(try Data(contentsOf: url),
+                                                       progress: progress)
+            return (r.dtos, r.skipped,
+                    "切出 \(r.blocks) 个题块。识别到的文字开头：\(r.preview)")
         case "docx":
-            return try DocumentImporter.fromDocx(try Data(contentsOf: url))
+            let r = try DocumentImporter.fromDocx(try Data(contentsOf: url))
+            return (r.dtos, r.skipped,
+                    "切出 \(r.blocks) 个题块。文字开头：\(r.preview)")
         case "doc":
             throw ImportError.badFormat("老版 .doc 读不了，在 Word/WPS 里另存为 .docx 再导一次")
         case "txt":
             let text = try String(contentsOf: url, encoding: .utf8)
             let r = try QuestionImporter.parseFormattedText(text)
-            return (r.dtos, r.skipped.count)
+            let preview = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
+            return (r.dtos, r.skipped.count,
+                    "切出 \(r.blocks) 个题块。文字开头：\(preview)")
         default:
             let data = try Data(contentsOf: url)
-            return (try QuestionImporter.fromJSON(data), 0)
+            return (try QuestionImporter.fromJSON(data), 0, "")
         }
     }
 
@@ -133,7 +145,8 @@ struct ImportView: View {
         for d in dtos {
             context.insert(Question(stem: d.stem, options: d.options,
                                     answerIndex: d.answerIndex,
-                                    explanation: d.explanation, deckName: deckName))
+                                    explanation: d.explanation, deckName: deckName,
+                                    isMulti: d.isMulti, answerIndices: d.answerIndices))
         }
         try? context.save()
     }
@@ -155,10 +168,15 @@ struct ImportView: View {
 
     private func makeExport() {
         let arr: [[String: Any]] = questions.map { q in
-            ["stem": q.stem,
-             "options": q.options,
-             "answer": letters[q.answerIndex],
-             "explanation": q.explanation]
+            var item: [String: Any] = ["stem": q.stem,
+                                       "options": q.options,
+                                       "explanation": q.explanation]
+            if q.isMulti {
+                item["answers"] = q.answerIndices.sorted().map { letters[$0] }
+            } else {
+                item["answer"] = letters[q.answerIndex]
+            }
+            return item
         }
         do {
             let data = try JSONSerialization.data(
