@@ -37,41 +37,47 @@ enum DocumentImporter {
     }
 
     // 逐页把 PDF 页面渲染成图，用 Vision 认字。识别顺序按版面从上到下排。
+    // 每页必须包在 autoreleasepool 里渲染完立刻释放：渲染图是自动释放对象，
+    // 后台循环里不包的话几十页就攒爆内存被系统杀掉（v3 实测跑到 48 页闪退）。
     private static func ocrText(from doc: PDFDocument,
                                 progress: @escaping (Int, Int) -> Void) async -> String {
         var all = ""
         for i in 0..<doc.pageCount {
-            defer { progress(i + 1, doc.pageCount) }
-            guard let page = doc.page(at: i) else { continue }
-            let bounds = page.bounds(for: .cropBox)
-            guard bounds.width > 1, bounds.height > 1 else { continue }
-            let scale: CGFloat = 200.0 / 72.0 // 约 200 dpi，识别更稳
-            let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-            let renderer = UIGraphicsImageRenderer(size: size)
-            let image = renderer.image { ctx in
-                UIColor.white.setFill()
-                ctx.fill(CGRect(origin: .zero, size: size))
-                let c = ctx.cgContext
-                c.translateBy(x: 0, y: size.height)
-                c.scaleBy(x: scale, y: -scale)
-                page.draw(with: .cropBox, to: c)
-            }
-            guard let cg = image.cgImage else { continue }
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.recognitionLanguages = ["zh-Hans", "en-US"]
-            request.usesLanguageCorrection = true
-            let handler = VNImageRequestHandler(cgImage: cg, options: [:])
-            try? handler.perform([request])
-            let found = (request.results as? [VNRecognizedTextObservation]) ?? []
-            let observations = found.sorted { a, b in
-                if abs(a.boundingBox.midY - b.boundingBox.midY) > 0.008 {
-                    return a.boundingBox.midY > b.boundingBox.midY
+            let pageText: String = autoreleasepool {
+                guard let page = doc.page(at: i) else { return "" }
+                let bounds = page.bounds(for: .cropBox)
+                guard bounds.width > 1, bounds.height > 1 else { return "" }
+                // 源图本身只有约 96 dpi，渲染倍数给 2 倍足够，再高只是插值、徒增内存
+                let scale: CGFloat = 2.0
+                let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+                let renderer = UIGraphicsImageRenderer(size: size)
+                let image = renderer.image { ctx in
+                    UIColor.white.setFill()
+                    ctx.fill(CGRect(origin: .zero, size: size))
+                    let c = ctx.cgContext
+                    c.translateBy(x: 0, y: size.height)
+                    c.scaleBy(x: scale, y: -scale)
+                    page.draw(with: .cropBox, to: c)
                 }
-                return a.boundingBox.minX < b.boundingBox.minX
+                guard let cg = image.cgImage else { return "" }
+                let request = VNRecognizeTextRequest()
+                request.recognitionLevel = .accurate
+                request.recognitionLanguages = ["zh-Hans", "en-US"]
+                request.usesLanguageCorrection = true
+                let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+                try? handler.perform([request])
+                let found = (request.results as? [VNRecognizedTextObservation]) ?? []
+                let observations = found.sorted { a, b in
+                    if abs(a.boundingBox.midY - b.boundingBox.midY) > 0.008 {
+                        return a.boundingBox.midY > b.boundingBox.midY
+                    }
+                    return a.boundingBox.minX < b.boundingBox.minX
+                }
+                let lines = observations.compactMap { $0.topCandidates(1).first?.string }
+                return lines.joined(separator: "\n")
             }
-            let lines = observations.compactMap { $0.topCandidates(1).first?.string }
-            all += lines.joined(separator: "\n") + "\n"
+            all += pageText + "\n"
+            progress(i + 1, doc.pageCount)
         }
         return all
     }
