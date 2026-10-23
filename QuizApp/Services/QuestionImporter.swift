@@ -90,8 +90,8 @@ enum QuestionImporter {
     // 答案也可以写成题干末尾的（B）这种形式。
     static func fromFormattedText(_ text: String) throws -> [QuestionDTO] {
         let ns = text as NSString
-        // 按"行首的题号"切块
-        let startRe = try NSRegularExpression(pattern: #"(?m)^[ \t]*\d{1,4}[ \t]*[.、．)）][ \t]*"#)
+        // 按题号切块：认 1. / 1、/（1）/ [1] / [1][单选] 这几种开头
+        let startRe = try NSRegularExpression(pattern: #"(?m)(?:^[ \t]*[\[【]\d{1,4}[\]】][ \t]*(?:\[(?:单选|多选|判断|填空)\])?|^[ \t]*\d{1,4}[ \t]*[.、．)）]|^[ \t]*[\(（]\d{1,4}[\)）])[ \t]*"#)
         let starts = startRe.matches(in: text, range: NSRange(location: 0, length: ns.length))
         guard !starts.isEmpty else {
             throw ImportError.badFormat("没找到题号（一行一道、题号开头的格式），看看填写说明里的文字版模板")
