@@ -3,9 +3,11 @@ import Foundation
 // 导入前的数据形态：跟 Question 一样，只是还没进数据库
 struct QuestionDTO {
     var stem: String
-    var options: [String]  // 必须 4 个
-    var answerIndex: Int    // 0-3
+    var options: [String]  // 单选/多选 4 个，判断 2 个
+    var answerIndex: Int    // 单选答案 0-3（多选时占位 0）
     var explanation: String
+    var isMulti: Bool = false
+    var answerIndices: [Int] = []  // 多选的正确答案集合
 }
 
 enum ImportError: LocalizedError {
@@ -27,18 +29,30 @@ enum QuestionImporter {
 
     // JSON 长这样：
     // [{"stem":"题干","options":["A项","B项","C项","D项"],"answer":"B","explanation":"解析，可空"}]
-    // 答案写 A/B/C/D 字母，对她最直觉
+    // 多选题把 answer 写成 "AC"，或用 "answers":["A","C"]
     static func fromJSON(_ data: Data) throws -> [QuestionDTO] {
         struct Raw: Decodable {
             var stem: String
             var options: [String]
-            var answer: String
+            var answer: String?
+            var answers: [String]?
             var explanation: String?
         }
         let raws = try JSONDecoder().decode([Raw].self, from: data)
         return try raws.enumerated().map { i, r in
-            try dto(stem: r.stem, options: r.options, answerLetter: r.answer,
-                    explanation: r.explanation ?? "", line: i + 1)
+            let letters = (r.answers ?? [r.answer ?? ""])
+                .joined()
+                .uppercased()
+                .filter { "ABCD".contains($0) }
+            let unique = Array(Set(letters)).sorted()
+            if unique.count > 1 {
+                return try dtoMulti(stem: r.stem, options: r.options,
+                                    answerLetters: unique.map { String($0) },
+                                    explanation: r.explanation ?? "", line: i + 1)
+            }
+            return try dto(stem: r.stem, options: r.options,
+                           answerLetter: String(unique.first ?? " "),
+                           explanation: r.explanation ?? "", line: i + 1)
         }
     }
 
@@ -54,6 +68,15 @@ enum QuestionImporter {
             }
             guard cols.count >= 6 else {
                 throw ImportError.badFormat("第 \(i + 2) 行列数不够（要 6 列：题干,A,B,C,D,答案）")
+            }
+            // 答案列写一个字母是单选，写 AC 这样连着的是多选
+            let letters = cols[5].uppercased().filter { "ABCD".contains($0) }
+            let unique = Array(Set(letters)).sorted()
+            if unique.count > 1 {
+                return try dtoMulti(stem: cols[0], options: Array(cols[1...4]),
+                                    answerLetters: unique.map { String($0) },
+                                    explanation: cols.count > 6 ? cols[6] : "",
+                                    line: i + 2)
             }
             return try dto(stem: cols[0], options: Array(cols[1...4]),
                            answerLetter: cols[5],
@@ -80,6 +103,33 @@ enum QuestionImporter {
         return QuestionDTO(stem: s, options: opts, answerIndex: idx, explanation: explanation)
     }
 
+    // 多选题校验：答案至少 2 个字母、不重复、都在选项范围内
+    static func dtoMulti(stem: String, options: [String], answerLetters: [String],
+                         explanation: String, line: Int) throws -> QuestionDTO {
+        let s = stem.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else {
+            throw ImportError.badFormat("第 \(line) 行题干是空的")
+        }
+        let opts = options.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard (2...4).contains(opts.count), opts.allSatisfy({ !$0.isEmpty }) else {
+            throw ImportError.badFormat("第 \(line) 行选项必须是 2 到 4 个非空的")
+        }
+        var indices: [Int] = []
+        for l in answerLetters {
+            let u = l.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            guard let idx = ["A", "B", "C", "D"].firstIndex(of: u), idx < opts.count else {
+                throw ImportError.badFormat("第 \(line) 行多选答案「\(l)」不对")
+            }
+            if !indices.contains(idx) { indices.append(idx) }
+        }
+        guard indices.count >= 2 else {
+            throw ImportError.badFormat("第 \(line) 行多选题答案至少要有 2 个")
+        }
+        return QuestionDTO(stem: s, options: opts, answerIndex: indices.sorted()[0],
+                           explanation: explanation, isMulti: true,
+                           answerIndices: indices.sorted())
+    }
+
     // 文字版题库：PDF / Word / txt 里提取出的文字都走这个解析器。认这种最常见的排版：
     // 1. 题干（可以占好几行）
     // A. 选项一  B. 选项二      （选项一行一个、或几个挤一行，都行）
@@ -89,7 +139,12 @@ enum QuestionImporter {
     // 解析：可有可无
     // 答案也可以写成题干末尾的（B）这种形式。
     // 宽容版解析：坏题跳过并记下是第几道，不因一道坏题整份失败（图片识别来源尤其需要）
-    static func parseFormattedText(_ text: String) throws -> (dtos: [QuestionDTO], skipped: [Int]) {
+    static func parseFormattedText(_ rawText: String) throws
+        -> (dtos: [QuestionDTO], skipped: [Int], blocks: Int) {
+        // OCR 经常把方括号认成全角 ［ ］，先统一成半角，不然 [1][单选] 切不出来
+        let text = rawText
+            .replacingOccurrences(of: "［", with: "[")
+            .replacingOccurrences(of: "］", with: "]")
         let ns = text as NSString
         // 按题号切块：认 1. / 1、/（1）/ [1] / [1][单选] 这几种开头
         let startRe = try NSRegularExpression(pattern: #"(?m)(?:^[ \t]*[\[【]\d{1,4}[\]】][ \t]*(?:\[(?:单选|多选|判断|填空)\])?|^[ \t]*\d{1,4}[ \t]*[.、．)）]|^[ \t]*[\(（]\d{1,4}[\)）])[ \t]*"#)
@@ -109,7 +164,7 @@ enum QuestionImporter {
                 skipped.append(bi + 1)
             }
         }
-        return (dtos, skipped)
+        return (dtos, skipped, starts.count)
     }
 
     static func fromFormattedText(_ text: String) throws -> [QuestionDTO] {
@@ -123,15 +178,11 @@ enum QuestionImporter {
     private static func parseBlock(_ rawBlock: String, index bi: Int) throws -> QuestionDTO {
             var block = rawBlock
 
-            // 先抠答案：答案：B / 【答案】B（多选会写成 答案：ABC，这种先跳过并计数）
-            var answerLetter: String?
+            // 先抠答案：答案：B / 【答案】B；多选写成 答案：ABC，抠出全部字母
+            var answerLetters: [String] = []
             if let am = firstMatch(#"(?:【)?(?:答案|正确答案)(?:】)?[ \t]*[:：]?[ \t]*([ABCD](?:[ \t]*[,，、和]?[ \t]*[ABCD])*)"#, in: block) {
                 let raw = (block as NSString).substring(with: am.range(at: 1))
-                let lettersOnly = raw.filter { "ABCD".contains($0) }
-                if lettersOnly.count > 1 {
-                    throw ImportError.badFormat("第 \(bi + 1) 题是多选题（答案不止一个字母），这个 App 只练单选和判断，先跳过")
-                }
-                answerLetter = lettersOnly
+                answerLetters = raw.filter { "ABCD".contains($0) }.map { String($0) }
                 block = replace(block, range: am.range, with: "")
             }
             // 再抠解析：解析：……一直到这道题结束
@@ -143,12 +194,12 @@ enum QuestionImporter {
                 block = (block as NSString).substring(to: em.range.location)
             }
             // 答案没单独写的话，认题干/选项里括号包着的：（B）
-            if answerLetter == nil,
+            if answerLetters.isEmpty,
                let am = firstMatch(#"[(（][ \t]*([ABCD])[ \t]*[)）]"#, in: block) {
-                answerLetter = (block as NSString).substring(with: am.range(at: 1))
+                answerLetters = [(block as NSString).substring(with: am.range(at: 1))]
                 block = replace(block, range: am.range, with: "")
             }
-            guard let ans = answerLetter else {
+            guard !answerLetters.isEmpty else {
                 throw ImportError.badFormat("第 \(bi + 1) 题没找到答案（要写「答案：B」或在题干后标（B））")
             }
             // 抠选项：找 A. B. C. D. 标记，标记之间就是选项内容。
@@ -171,7 +222,12 @@ enum QuestionImporter {
                 options.append(bns.substring(with: NSRange(location: s, length: e - s))
                     .trimmingCharacters(in: .whitespacesAndNewlines))
             }
-            return try dto(stem: stem, options: options, answerLetter: ans,
+            if answerLetters.count > 1 {
+                return try dtoMulti(stem: stem, options: options,
+                                    answerLetters: answerLetters,
+                                    explanation: explanation, line: bi + 1)
+            }
+            return try dto(stem: stem, options: options, answerLetter: answerLetters[0],
                            explanation: explanation, line: bi + 1)
     }
 
