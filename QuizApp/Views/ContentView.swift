@@ -1,21 +1,25 @@
 import SwiftUI
 import SwiftData
 
-// 首页：三个 Tab —— 刷题 / 错题本 / 题库
+// 首页：四个 Tab —— 刷题 / 错题本 / 收藏 / 题库
+// 她的规矩：题目全部随机顺序；单选（含判断）和多选是两个大类
 struct ContentView: View {
     @Query private var questions: [Question]
-    @State private var shuffle = true
     @State private var wrongOnly = false
     @State private var session: QuizSession?
 
     var wrongQuestions: [Question] { questions.filter(\.isInWrongBank) }
+    var singlePool: [Question] { questions.filter { !$0.isMulti } }
+    var multiPool: [Question] { questions.filter(\.isMulti) }
 
     var body: some View {
         TabView {
             quizTab
                 .tabItem { Label("刷题", systemImage: "pencil.circle") }
-            WrongBankView(startQuiz: startQuiz)
+            WrongBankView(startQuiz: { pool, mastery in startQuiz(pool, mastery: mastery) })
                 .tabItem { Label("错题本", systemImage: "xmark.circle") }
+            FavoritesView(startQuiz: { pool, mastery in startQuiz(pool, mastery: mastery) })
+                .tabItem { Label("收藏", systemImage: "star") }
             ImportView()
                 .tabItem { Label("题库", systemImage: "tray.full") }
         }
@@ -34,18 +38,29 @@ struct ContentView: View {
                         description: Text("去「题库」页导入题库，或先载入示例题试试手")
                     )
                 } else {
-                    let pool = wrongOnly ? wrongQuestions : questions
-                    VStack(alignment: .leading, spacing: 12) {
-                        Toggle("随机顺序", isOn: $shuffle)
-                        Toggle("只刷错题本（\(wrongQuestions.count) 道）", isOn: $wrongOnly)
-                    }
-                    Button("开始刷题（\(pool.count) 道）") {
-                        startQuiz(pool, shuffle: shuffle)
+                    let base = wrongOnly ? wrongQuestions : questions
+                    let singles = base.filter { !$0.isMulti }
+                    let multis = base.filter(\.isMulti)
+                    Toggle("只刷错题本（\(wrongQuestions.count) 道）", isOn: $wrongOnly)
+                    Button("随机刷全部（\(base.count) 道）") {
+                        startQuiz(base, mastery: wrongOnly)
                     }
                     .primaryGlassButton()
                     .controlSize(.large)
-                    .disabled(pool.isEmpty)
-                    Text("题库共 \(questions.count) 道")
+                    .disabled(base.isEmpty)
+                    HStack(spacing: 12) {
+                        Button("单选（含判断）\(singles.count) 道") {
+                            startQuiz(singles, mastery: wrongOnly)
+                        }
+                        .primaryGlassButton()
+                        .disabled(singles.isEmpty)
+                        Button("多选 \(multis.count) 道") {
+                            startQuiz(multis, mastery: wrongOnly)
+                        }
+                        .primaryGlassButton()
+                        .disabled(multis.isEmpty)
+                    }
+                    Text("题库共 \(questions.count) 道：单选（含判断）\(singlePool.count) 道、多选 \(multiPool.count) 道")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -55,9 +70,9 @@ struct ContentView: View {
         }
     }
 
-    private func startQuiz(_ pool: [Question], shuffle: Bool) {
+    private func startQuiz(_ pool: [Question], mastery: Bool) {
         let s = QuizSession()
-        s.start(questions: pool, shuffle: shuffle)
+        s.start(questions: pool, shuffle: true, mastery: mastery)
         session = s
     }
 }
