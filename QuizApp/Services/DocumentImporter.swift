@@ -11,7 +11,7 @@ enum DocumentImporter {
 
     static func fromPDF(_ data: Data,
                         progress: @escaping (Int, Int) -> Void) async throws
-        -> (dtos: [QuestionDTO], skipped: Int) {
+        -> (dtos: [QuestionDTO], skipped: Int, blocks: Int, preview: String) {
         guard let doc = PDFDocument(data: data) else {
             throw ImportError.badFormat("这个 PDF 打不开，可能已损坏或加了密码")
         }
@@ -24,7 +24,7 @@ enum DocumentImporter {
         text = stripRepeatedPageLines(text)
         if text.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 {
             let r = try QuestionImporter.parseFormattedText(text)
-            return (r.dtos, r.skipped.count)
+            return (r.dtos, r.skipped.count, r.blocks, preview(of: text))
         }
         // 没有文字层：整本是图片，逐页 OCR
         let ocr = await ocrText(from: doc, progress: progress)
@@ -33,7 +33,13 @@ enum DocumentImporter {
             throw ImportError.badFormat("这个 PDF 全是图片，自动识别也没读出文字（图片太糊的话识别不了），换个清晰点的版本再试")
         }
         let r = try QuestionImporter.parseFormattedText(cleaned)
-        return (r.dtos, r.skipped.count)
+        return (r.dtos, r.skipped.count, r.blocks, preview(of: cleaned))
+    }
+
+    // 导入失败时给用户看的诊断：识别出的文字开头一截，方便截图定位问题
+    private static func preview(of text: String) -> String {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(t.prefix(120))
     }
 
     // 逐页把 PDF 页面渲染成图，用 Vision 认字。识别顺序按版面从上到下排。
@@ -84,7 +90,8 @@ enum DocumentImporter {
 
     // .docx 本质是个 zip 包：解开它，取 word/document.xml，把 XML 标签剥掉就是正文。
     // 老版 .doc 是二进制格式、不是 zip，解不开会走到报错，提示另存为 .docx。
-    static func fromDocx(_ data: Data) throws -> (dtos: [QuestionDTO], skipped: Int) {
+    static func fromDocx(_ data: Data) throws
+        -> (dtos: [QuestionDTO], skipped: Int, blocks: Int, preview: String) {
         guard let archive = try? Archive(data: data, accessMode: .read),
               let entry = archive["word/document.xml"]
         else {
@@ -104,7 +111,7 @@ enum DocumentImporter {
             throw ImportError.badFormat("这个 Word 文件里没读到多少文字，检查一下文件是不是空的")
         }
         let r = try QuestionImporter.parseFormattedText(text)
-        return (r.dtos, r.skipped.count)
+        return (r.dtos, r.skipped.count, r.blocks, preview(of: text))
     }
 
     // 页眉页脚清理：同一行短文字在全书重复出现很多次（比如题库水印名），
