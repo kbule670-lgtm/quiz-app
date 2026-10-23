@@ -11,6 +11,8 @@ final class Question {
     var answerIndex: Int    // 正确答案是第几个（0-3，对应 A-D）
     var explanation: String // 解析，可空
     var deckName: String    // 哪次导入的题库
+    var batchID: String?    // 导入批次（同一次导入同一个值）；老数据为 nil，按 deckName 分组
+    var importedAt: Date?   // 导入时间（分组排序用）；老数据为 nil
     var isMulti: Bool       // 多选题（答案不止一个）
     var answerIndices: [Int] // 多选题的正确答案集合（单选时为空，用 answerIndex）
     var isFavorite: Bool    // 收藏夹
@@ -30,22 +32,26 @@ final class Question {
 
     // 正确答案的字母表示：单选一个字母，多选如「A、C」
     var correctAnswerText: String {
-        let letters = ["A", "B", "C", "D"]
+        let letters = ["A", "B", "C", "D", "E"]
+        func letter(_ i: Int) -> String { letters.indices.contains(i) ? letters[i] : "?" }
         if isMulti {
-            return answerIndices.sorted().map { letters[$0] }.joined(separator: "、")
+            return answerIndices.sorted().map { letter($0) }.joined(separator: "、")
         }
-        return letters[answerIndex]
+        return letter(answerIndex)
     }
 
     init(stem: String, options: [String], answerIndex: Int,
          explanation: String = "", deckName: String = "默认题库",
-         isMulti: Bool = false, answerIndices: [Int] = []) {
+         isMulti: Bool = false, answerIndices: [Int] = [],
+         batchID: String? = nil, importedAt: Date? = nil) {
         self.id = UUID()
         self.stem = stem
         self.options = options
         self.answerIndex = answerIndex
         self.explanation = explanation
         self.deckName = deckName
+        self.batchID = batchID
+        self.importedAt = importedAt
         self.isMulti = isMulti
         self.answerIndices = answerIndices
         self.isFavorite = false

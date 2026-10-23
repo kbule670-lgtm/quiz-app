@@ -12,6 +12,15 @@ enum DocumentImporter {
     static func fromPDF(_ data: Data,
                         progress: @escaping (Int, Int) -> Void) async throws
         -> (dtos: [QuestionDTO], skipped: Int, blocks: Int, preview: String) {
+        let text = try await pdfText(data, progress: progress)
+        let r = try QuestionImporter.parseFormattedText(text)
+        return (r.dtos, r.skipped.count, r.blocks, preview(of: text))
+    }
+
+    // 只把 PDF 的文字抠出来（有文字层直接读，没有就逐页 OCR），先不解析。
+    // AI 解析路径要用原文，所以单独拆出来。
+    static func pdfText(_ data: Data,
+                        progress: @escaping (Int, Int) -> Void) async throws -> String {
         guard let doc = PDFDocument(data: data) else {
             throw ImportError.badFormat("这个 PDF 打不开，可能已损坏或加了密码")
         }
@@ -23,8 +32,7 @@ enum DocumentImporter {
         }
         text = stripRepeatedPageLines(text)
         if text.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 {
-            let r = try QuestionImporter.parseFormattedText(text)
-            return (r.dtos, r.skipped.count, r.blocks, preview(of: text))
+            return text
         }
         // 没有文字层：整本是图片，逐页 OCR
         let ocr = await ocrText(from: doc, progress: progress)
@@ -32,8 +40,7 @@ enum DocumentImporter {
         guard cleaned.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 else {
             throw ImportError.badFormat("这个 PDF 全是图片，自动识别也没读出文字（图片太糊的话识别不了），换个清晰点的版本再试")
         }
-        let r = try QuestionImporter.parseFormattedText(cleaned)
-        return (r.dtos, r.skipped.count, r.blocks, preview(of: cleaned))
+        return cleaned
     }
 
     // 导入失败时给用户看的诊断：识别出的文字开头一截，方便截图定位问题
@@ -92,6 +99,13 @@ enum DocumentImporter {
     // 老版 .doc 是二进制格式、不是 zip，解不开会走到报错，提示另存为 .docx。
     static func fromDocx(_ data: Data) throws
         -> (dtos: [QuestionDTO], skipped: Int, blocks: Int, preview: String) {
+        let text = try docxText(data)
+        let r = try QuestionImporter.parseFormattedText(text)
+        return (r.dtos, r.skipped.count, r.blocks, preview(of: text))
+    }
+
+    // 只把 .docx 的正文文字抠出来，先不解析（AI 解析路径用）
+    static func docxText(_ data: Data) throws -> String {
         guard let archive = try? Archive(data: data, accessMode: .read),
               let entry = archive["word/document.xml"]
         else {
@@ -110,8 +124,7 @@ enum DocumentImporter {
         guard text.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 else {
             throw ImportError.badFormat("这个 Word 文件里没读到多少文字，检查一下文件是不是空的")
         }
-        let r = try QuestionImporter.parseFormattedText(text)
-        return (r.dtos, r.skipped.count, r.blocks, preview(of: text))
+        return text
     }
 
     // 页眉页脚清理：同一行短文字在全书重复出现很多次（比如题库水印名），
@@ -128,7 +141,7 @@ enum DocumentImporter {
             let c = counts[t] ?? 0
             // 结构行（答案/解析/选项/题号开头）永不删，哪怕重复再多次
             if t.hasPrefix("答案") || t.hasPrefix("解析") { return true }
-            if let f = t.first, "ABCD".contains(f) || f.isNumber || f == "[" || f == "【" {
+            if let f = t.first, "ABCDE".contains(f) || f.isNumber || f == "[" || f == "【" {
                 return true
             }
             if t.count <= 12, c >= 4 { return false } // 短页眉水印

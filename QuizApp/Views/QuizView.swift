@@ -7,7 +7,7 @@ struct QuizView: View {
     @Environment(\.dismiss) private var dismiss
     let session: QuizSession
 
-    private let letters = ["A", "B", "C", "D"]
+    private let letters = ["A", "B", "C", "D", "E"]
 
     var body: some View {
         NavigationStack {
