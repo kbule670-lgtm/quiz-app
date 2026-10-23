@@ -31,5 +31,19 @@ enum SampleBank {
             answerIndex: 1,
             explanation: "叶绿体是光合作用的场所。"
         ),
+        QuestionDTO(
+            stem: "示例·多选：下列说法正确的是？（多选，试试勾选和提交）",
+            options: ["水是化合物", "氧气是单质", "盐酸是纯净物", "空气是混合物"],
+            answerIndex: 0,
+            explanation: "盐酸是 HCl 的水溶液，是混合物；其余都对，答案 A、B、D。",
+            isMulti: true,
+            answerIndices: [0, 1, 3]
+        ),
+        QuestionDTO(
+            stem: "示例·判断：地球是太阳系中唯一有生命的已知行星。（判断题，只有两个选项）",
+            options: ["正确", "错误"],
+            answerIndex: 0,
+            explanation: ""
+        ),
     ]
 }
