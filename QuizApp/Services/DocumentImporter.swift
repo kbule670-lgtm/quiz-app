@@ -17,6 +17,7 @@ enum DocumentImporter {
                 text += pageText + "\n"
             }
         }
+        text = stripRepeatedPageLines(text)
         guard text.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 else {
             throw ImportError.badFormat("这个 PDF 里读不到文字，多半是扫描/图片版；先在 WPS 里转成文字版 PDF 或 Word 再导")
         }
@@ -47,6 +48,26 @@ enum DocumentImporter {
             throw ImportError.badFormat("这个 Word 文件里没读到多少文字，检查一下文件是不是空的")
         }
         return try QuestionImporter.fromFormattedText(text)
+    }
+
+    // 页眉页脚清理：同一行短文字在全书重复出现很多次（比如题库水印名），
+    // 大概率是页眉页脚，删掉免得粘到题干/选项里。答案行、选项行、题号行永不删。
+    static func stripRepeatedPageLines(_ text: String) -> String {
+        let lines = text.components(separatedBy: "\n")
+        var counts: [String: Int] = [:]
+        for l in lines {
+            let t = l.trimmingCharacters(in: .whitespaces)
+            if !t.isEmpty { counts[t, default: 0] += 1 }
+        }
+        return lines.filter { raw in
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            guard t.count <= 12, (counts[t] ?? 0) >= 4 else { return true }
+            if t.hasPrefix("答案") || t.hasPrefix("解析") { return true }
+            if let f = t.first, "ABCD".contains(f) || f.isNumber || f == "[" || f == "【" {
+                return true
+            }
+            return false
+        }.joined(separator: "\n")
     }
 
     // document.xml → 纯文字：段落末尾变回车，剥掉所有标签，再把 XML 转义符还原
