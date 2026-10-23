@@ -118,12 +118,15 @@ enum DocumentImporter {
         }
         return lines.filter { raw in
             let t = raw.trimmingCharacters(in: .whitespaces)
-            guard t.count <= 12, (counts[t] ?? 0) >= 4 else { return true }
+            let c = counts[t] ?? 0
+            // 结构行（答案/解析/选项/题号开头）永不删，哪怕重复再多次
             if t.hasPrefix("答案") || t.hasPrefix("解析") { return true }
             if let f = t.first, "ABCD".contains(f) || f.isNumber || f == "[" || f == "【" {
                 return true
             }
-            return false
+            if t.count <= 12, c >= 4 { return false } // 短页眉水印
+            if t.count <= 40, c >= 20 { return false } // 每页都有的页脚注（如更新说明那行）
+            return true
         }.joined(separator: "\n")
     }
 
