@@ -16,6 +16,7 @@ struct ImportView: View {
     @State private var showNotice = false
     @State private var confirmClear = false
     @State private var exportURL: URL?
+    @State private var importStatus: String?
 
     private let letters = ["A", "B", "C", "D"]
 
@@ -24,7 +25,16 @@ struct ImportView: View {
             List {
                 Section("导入") {
                     Button("从文件导入题库（PDF / Word / JSON / CSV / txt）") { showImporter = true }
+                        .disabled(importStatus != nil)
                     Button("载入内置示例题") { loadSample() }
+                }
+                if let status = importStatus {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text(status).font(.callout)
+                        }
+                    }
                 }
                 Section("题库（\(questions.count) 道）") {
                     ForEach(questions) { q in
@@ -66,34 +76,56 @@ struct ImportView: View {
     }
 
     private func handleImportURL(_ url: URL) {
-        do {
-            // asCopy 复制来的文件在临时目录，一般不用权限；保险起见试一下，有就用完释放
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            let dtos: [QuestionDTO]
-            let ext = url.pathExtension.lowercased()
-            switch ext {
-            case "csv":
-                let text = try String(contentsOf: url, encoding: .utf8)
-                dtos = try QuestionImporter.fromCSV(text)
-            case "pdf":
-                dtos = try DocumentImporter.fromPDF(try Data(contentsOf: url))
-            case "docx":
-                dtos = try DocumentImporter.fromDocx(try Data(contentsOf: url))
-            case "doc":
-                say("老版 .doc 读不了，在 Word/WPS 里另存为 .docx 再导一次"); return
-            case "txt":
-                let text = try String(contentsOf: url, encoding: .utf8)
-                dtos = try QuestionImporter.fromFormattedText(text)
-            default:
-                let data = try Data(contentsOf: url)
-                dtos = try QuestionImporter.fromJSON(data)
+        let deckName = url.deletingPathExtension().lastPathComponent
+        importStatus = "正在读取文件…"
+        Task {
+            do {
+                let result = try await Self.loadDTOs(from: url) { cur, total in
+                    DispatchQueue.main.async {
+                        importStatus = "这份 PDF 是图片版的，正在逐页识别文字：第 \(cur)/\(total) 页，耐心等一下"
+                    }
+                }
+                importStatus = nil
+                guard !result.dtos.isEmpty else { say("文件里没有读到题目"); return }
+                insert(result.dtos, deckName: deckName)
+                var msg = "导入成功：\(result.dtos.count) 道题"
+                if result.skipped > 0 {
+                    msg += "\n另有 \(result.skipped) 道没认出来，已跳过（多半是排版或图片识别的问题）"
+                }
+                say(msg)
+            } catch {
+                importStatus = nil
+                say("导入失败：\(error.localizedDescription)")
             }
-            guard !dtos.isEmpty else { say("文件里没有读到题目"); return }
-            insert(dtos, deckName: url.deletingPathExtension().lastPathComponent)
-            say("导入成功：\(dtos.count) 道题")
-        } catch {
-            say("导入失败：\(error.localizedDescription)")
+        }
+    }
+
+    // 实际读文件+解析，PDF 图片版会在里面逐页识别（慢，所以放后台跑）
+    private static func loadDTOs(from url: URL,
+                                 progress: @escaping (Int, Int) -> Void) async throws
+        -> (dtos: [QuestionDTO], skipped: Int) {
+        // asCopy 复制来的文件在临时目录，一般不用权限；保险起见试一下，有就用完释放
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let ext = url.pathExtension.lowercased()
+        switch ext {
+        case "csv":
+            let text = try String(contentsOf: url, encoding: .utf8)
+            return (try QuestionImporter.fromCSV(text), 0)
+        case "pdf":
+            return try await DocumentImporter.fromPDF(try Data(contentsOf: url),
+                                                      progress: progress)
+        case "docx":
+            return try DocumentImporter.fromDocx(try Data(contentsOf: url))
+        case "doc":
+            throw ImportError.badFormat("老版 .doc 读不了，在 Word/WPS 里另存为 .docx 再导一次")
+        case "txt":
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let r = try QuestionImporter.parseFormattedText(text)
+            return (r.dtos, r.skipped.count)
+        default:
+            let data = try Data(contentsOf: url)
+            return (try QuestionImporter.fromJSON(data), 0)
         }
     }
 
