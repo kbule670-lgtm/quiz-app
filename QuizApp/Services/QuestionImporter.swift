@@ -88,7 +88,8 @@ enum QuestionImporter {
     // 答案：B
     // 解析：可有可无
     // 答案也可以写成题干末尾的（B）这种形式。
-    static func fromFormattedText(_ text: String) throws -> [QuestionDTO] {
+    // 宽容版解析：坏题跳过并记下是第几道，不因一道坏题整份失败（图片识别来源尤其需要）
+    static func parseFormattedText(_ text: String) throws -> (dtos: [QuestionDTO], skipped: [Int]) {
         let ns = text as NSString
         // 按题号切块：认 1. / 1、/（1）/ [1] / [1][单选] 这几种开头
         let startRe = try NSRegularExpression(pattern: #"(?m)(?:^[ \t]*[\[【]\d{1,4}[\]】][ \t]*(?:\[(?:单选|多选|判断|填空)\])?|^[ \t]*\d{1,4}[ \t]*[.、．)）]|^[ \t]*[\(（]\d{1,4}[\)）])[ \t]*"#)
@@ -97,10 +98,30 @@ enum QuestionImporter {
             throw ImportError.badFormat("没找到题号（一行一道、题号开头的格式），看看填写说明里的文字版模板")
         }
         var dtos: [QuestionDTO] = []
+        var skipped: [Int] = []
         for (bi, m) in starts.enumerated() {
             let from = m.range.upperBound
             let to = bi + 1 < starts.count ? starts[bi + 1].range.location : ns.length
-            var block = ns.substring(with: NSRange(location: from, length: to - from))
+            let rawBlock = ns.substring(with: NSRange(location: from, length: to - from))
+            do {
+                dtos.append(try parseBlock(rawBlock, index: bi))
+            } catch {
+                skipped.append(bi + 1)
+            }
+        }
+        return (dtos, skipped)
+    }
+
+    static func fromFormattedText(_ text: String) throws -> [QuestionDTO] {
+        let r = try parseFormattedText(text)
+        if r.dtos.isEmpty {
+            throw ImportError.badFormat("一道题都没认出来，看看填写说明里的文字版模板")
+        }
+        return r.dtos
+    }
+
+    private static func parseBlock(_ rawBlock: String, index bi: Int) throws -> QuestionDTO {
+            var block = rawBlock
 
             // 先抠答案：答案：B / 【答案】B
             var answerLetter: String?
@@ -143,10 +164,8 @@ enum QuestionImporter {
                 options.append(bns.substring(with: NSRange(location: s, length: e - s))
                     .trimmingCharacters(in: .whitespacesAndNewlines))
             }
-            dtos.append(try dto(stem: stem, options: options, answerLetter: ans,
-                                explanation: explanation, line: bi + 1))
-        }
-        return dtos
+            return try dto(stem: stem, options: options, answerLetter: ans,
+                           explanation: explanation, line: bi + 1)
     }
 
     private static func firstMatch(_ pattern: String, in text: String) -> NSTextCheckingResult? {
