@@ -46,12 +46,8 @@ struct ImportView: View {
                 }
             }
             .navigationTitle("题库")
-            .fileImporter(
-                isPresented: $showImporter,
-                allowedContentTypes: [.json, .commaSeparatedText, .pdf, .plainText,
-                                      UTType("org.openxmlformats.wordprocessingml.document") ?? .data]
-            ) { result in
-                handleImport(result)
+            .sheet(isPresented: $showImporter) {
+                DocumentPicker { url in handleImportURL(url) }
             }
             .alert("提示", isPresented: $showNotice, presenting: notice) { _ in } message: { n in
                 Text(n.text)
@@ -69,13 +65,11 @@ struct ImportView: View {
         showNotice = true
     }
 
-    private func handleImport(_ result: Result<URL, Error>) {
+    private func handleImportURL(_ url: URL) {
         do {
-            let url = try result.get()
-            guard url.startAccessingSecurityScopedResource() else {
-                say("打不开这个文件，换个位置再试一次"); return
-            }
-            defer { url.stopAccessingSecurityScopedResource() }
+            // asCopy 复制来的文件在临时目录，一般不用权限；保险起见试一下，有就用完释放
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let dtos: [QuestionDTO]
             let ext = url.pathExtension.lowercased()
             switch ext {
