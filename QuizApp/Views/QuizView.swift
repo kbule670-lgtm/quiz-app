@@ -1,6 +1,7 @@
 import SwiftUI
 
-// 刷题页：一题一屏，选完立刻判分，答错标红+给解析
+// 刷题页：一题一屏。单选/判断点一个就判分；多选先勾选、点提交才判分。
+// 右上角星星是收藏开关，点亮收进收藏夹，再点取消。
 struct QuizView: View {
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
@@ -24,6 +25,17 @@ struct QuizView: View {
                     Button("退出") {
                         try? context.save()
                         dismiss()
+                    }
+                }
+                if let q = session.current {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            q.isFavorite.toggle()
+                            try? context.save()
+                        } label: {
+                            Image(systemName: q.isFavorite ? "star.fill" : "star")
+                                .foregroundStyle(q.isFavorite ? .yellow : .primary)
+                        }
                     }
                 }
             }
@@ -53,18 +65,35 @@ struct QuizView: View {
     private func questionView(_ q: Question) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("第 \(session.cursor + 1) / \(session.total) 题")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack {
+                    Text("第 \(session.cursor + 1) / \(session.total) 题")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(q.isMulti ? "多选题" : (q.options.count == 2 ? "判断题" : "单选题"))
+                        .font(.caption)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(Color(.secondarySystemBackground), in: Capsule())
+                    if q.isMulti && !session.answered {
+                        Text("可多选，选好点提交")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Text(q.stem)
                     .font(.title3)
                     .bold()
                 ForEach(q.options.indices, id: \.self) { i in
-                    Button { session.choose(i) } label: {
+                    Button {
+                        if q.isMulti { session.toggle(i) } else { session.choose(i) }
+                    } label: {
                         HStack {
                             Text(letters[i]).bold()
                             Text(q.options[i])
                             Spacer()
+                            if q.isMulti && session.selectedSet.contains(i) {
+                                Image(systemName: "checkmark.circle.fill")
+                            }
                         }
                         .padding()
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -74,11 +103,16 @@ struct QuizView: View {
                     .disabled(session.answered)
                     .foregroundStyle(.primary)
                 }
+                if q.isMulti && !session.answered {
+                    Button("提交答案") { session.submitMulti() }
+                        .primaryGlassButton()
+                        .disabled(session.selectedSet.isEmpty)
+                }
                 if session.answered {
-                    if session.selectedIndex == q.answerIndex {
+                    if wasCorrect(q) {
                         Text("答对了 ✓").foregroundStyle(.green).bold()
                     } else {
-                        Text("答错了，正确答案是 \(letters[q.answerIndex])")
+                        Text("答错了，正确答案是 \(q.correctAnswerText)")
                             .foregroundStyle(.red).bold()
                     }
                     if !q.explanation.isEmpty {
@@ -96,7 +130,22 @@ struct QuizView: View {
         }
     }
 
+    private func wasCorrect(_ q: Question) -> Bool {
+        if q.isMulti { return session.selectedSet == Set(q.answerIndices) }
+        return session.selectedIndex == q.answerIndex
+    }
+
     private func optionColor(_ i: Int, q: Question) -> Color {
+        if q.isMulti {
+            if session.answered {
+                if q.answerIndices.contains(i) { return .green.opacity(0.25) }
+                if session.selectedSet.contains(i) { return .red.opacity(0.25) }
+                return Color(.secondarySystemBackground)
+            }
+            return session.selectedSet.contains(i)
+                ? .blue.opacity(0.25)
+                : Color(.secondarySystemBackground)
+        }
         guard session.answered else { return Color(.secondarySystemBackground) }
         if i == q.answerIndex { return .green.opacity(0.25) }
         if i == session.selectedIndex { return .red.opacity(0.25) }
