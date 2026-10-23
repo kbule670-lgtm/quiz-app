@@ -44,7 +44,7 @@ var explanation: String?
 }
 let raws = try JSONDecoder().decode([Raw].self, from: data)
 return try raws.enumerated().map { i, r in
-let letters = (r.answers?? [r.answer?? ""])
+let letters = (r.answers ?? [r.answer ?? ""])
 .joined()
 .uppercased()
 .filter { allLetterChars.contains($0)}
@@ -52,11 +52,11 @@ let unique = Array(Set(letters)).sorted()
 if unique.count > 1 {
 return try dtoMulti(stem: r.stem, options: r.options,
 answerLetters: unique.map { String($0)},
-explanation: r.explanation?? "", line: i + 1)
+explanation: r.explanation ?? "", line: i + 1)
 }
 return try dto(stem: r.stem, options: r.options,
-answerLetter: String(unique.first?? " "),
-explanation: r.explanation?? "", line: i + 1)
+answerLetter: String(unique.first ?? " "),
+explanation: r.explanation ?? "", line: i + 1)
 }
 }
 
@@ -76,9 +76,9 @@ throw ImportError.badFormat("第 \(i + 2) 行列数不够（要 6 列：题干,A
 }
 // 8 列及以上按带 E 选项的版式读：题干,A,B,C,D,E,答案,解析
 let hasE = cols.count >= 8
-let options = hasE? Array(cols[1...5]): Array(cols[1...4])
-let answerCol = hasE? cols[6]: cols[5]
-let explanation = hasE? cols[7]: (cols.count > 6? cols[6]: "")
+let options = hasE ? Array(cols[1...5]) : Array(cols[1...4])
+let answerCol = hasE ? cols[6] : cols[5]
+let explanation = hasE ? cols[7] : (cols.count > 6 ? cols[6] : "")
 // 答案列写一个字母是单选，写 AC 这样连着的是多选
 let letters = answerCol.uppercased().filter { allLetterChars.contains($0)}
 let unique = Array(Set(letters)).sorted()
@@ -99,7 +99,7 @@ line: i + 2)
 static func dto(stem: String, options: [String], answerLetter: String,
 explanation: String, line: Int) throws -> QuestionDTO {
 let s = stem.trimmingCharacters(in:.whitespacesAndNewlines)
-guard!s.isEmpty else {
+guard !s.isEmpty else {
 throw ImportError.badFormat("第 \(line) 行题干是空的")
 }
 let opts = options.map { $0.trimmingCharacters(in:.whitespacesAndNewlines)}
@@ -117,7 +117,7 @@ return QuestionDTO(stem: s, options: opts, answerIndex: idx, explanation: explan
 static func dtoMulti(stem: String, options: [String], answerLetters: [String],
 explanation: String, line: Int) throws -> QuestionDTO {
 let s = stem.trimmingCharacters(in:.whitespacesAndNewlines)
-guard!s.isEmpty else {
+guard !s.isEmpty else {
 throw ImportError.badFormat("第 \(line) 行题干是空的")
 }
 let opts = options.map { $0.trimmingCharacters(in:.whitespacesAndNewlines)}
@@ -130,7 +130,7 @@ let u = l.trimmingCharacters(in:.whitespacesAndNewlines).uppercased()
 guard let idx = allLetters.firstIndex(of: u), idx < opts.count else {
 throw ImportError.badFormat("第 \(line) 行多选答案「\(l)」不对")
 }
-if!indices.contains(idx) { indices.append(idx)}
+if !indices.contains(idx) { indices.append(idx)}
 }
 guard indices.count >= 2 else {
 throw ImportError.badFormat("第 \(line) 行多选题答案至少要有 2 个")
@@ -167,13 +167,13 @@ guard let startRe = try? NSRegularExpression(
 else { return []}
 let starts = startRe.matches(in: text, range: NSRange(location: 0, length: ns.length))
 return starts.enumerated().map { bi, m in
-let blockEnd = bi + 1 < starts.count? starts[bi + 1].range.location: ns.length
+let blockEnd = bi + 1 < starts.count ? starts[bi + 1].range.location : ns.length
 let raw = ns.substring(with: NSRange(location: m.range.location,
 length: blockEnd - m.range.location))
 let body = ns.substring(with: NSRange(location: m.range.upperBound,
 length: blockEnd - m.range.upperBound))
-let hint = m.range(at: 2).location!= NSNotFound
-? ns.substring(with: m.range(at: 2)): nil
+let hint = m.range(at: 2).location != NSNotFound
+? ns.substring(with: m.range(at: 2)) : nil
 return RawBlock(typeHint: hint, body: body, raw: raw)
 }
 }
@@ -189,7 +189,7 @@ return RawBlock(typeHint: hint, body: body, raw: raw)
 static func parseFormattedText(_ rawText: String) throws
 -> (dtos: [QuestionDTO], skipped: [Int], blocks: Int) {
 let blocks = splitBlocks(rawText)
-guard!blocks.isEmpty else {
+guard !blocks.isEmpty else {
 throw ImportError.badFormat("没找到题号（一行一道、题号开头的格式），看看填写说明里的文字版模板")
 }
 var dtos: [QuestionDTO] = []
@@ -237,7 +237,7 @@ let am = firstMatch(#"[(（][ \t]*([ABCDE])[ \t]*[)）]"#, in: block) {
 answerLetters = [(block as NSString).substring(with: am.range(at: 1))]
 block = replace(block, range: am.range, with: "")
 }
-guard!answerLetters.isEmpty else {
+guard !answerLetters.isEmpty else {
 throw ImportError.badFormat("第 \(bi + 1) 题没找到答案（要写「答案：B」或在题干后标（B））")
 }
 // 去重保序
@@ -269,7 +269,7 @@ stem = replace(stem, range: tm.range, with: "")
 var options: [String] = []
 for i in 0..<n {
 let s = opts[i].range.upperBound
-let e = i + 1 < n? opts[i + 1].range.location: bns.length
+let e = i + 1 < n ? opts[i + 1].range.location : bns.length
 options.append(bns.substring(with: NSRange(location: s, length: e - s))
 .trimmingCharacters(in:.whitespacesAndNewlines))
 }
