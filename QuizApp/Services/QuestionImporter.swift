@@ -163,7 +163,7 @@ static func splitBlocks(_ rawText: String) -> [RawBlock] {
 let text = normalize(rawText)
 let ns = text as NSString
 guard let startRe = try? NSRegularExpression(
-pattern: "(?m)^[ \t]*(?:[\[\u{3010}](\d{1,4})[\]\u{3011}][ \t]*(?:[\[\u{3010}\(（](单选|多选|判断|填空)[\]\u{3011}\)）])?|(\d{1,4})[ \t]*[.、．)）]|[\(（](\d{1,4})[\)）])[ \t]*")
+        pattern: "(?m)^[ \\t]*(?:[\\[\u{3010}](\\d{1,4})[\\]\u{3011}][ \\t]*(?:[\\[\u{3010}\\(（](单选|多选|判断|填空)[\\]\u{3011}\\)）])?|(\\d{1,4})[ \\t]*[.、．)）]|[\\(（](\\d{1,4})[\\)）])[ \\t]*")
 else { return []}
 let starts = startRe.matches(in: text, range: NSRange(location: 0, length: ns.length))
 return starts.enumerated().map { bi, m in
@@ -262,7 +262,7 @@ throw ImportError.badFormat("第 \(bi + 1) 题选项没凑齐（单选要 A、B�
 var stem = bns.substring(to: opts[0].range.location)
 .trimmingCharacters(in:.whitespacesAndNewlines)
 // 题型标记要是没被题号正则吃掉（比如单独占了一行），从题干开头摘掉
-if let tm = firstMatch("^[\[\u{3010}\(（](?:单选|多选|判断|填空)[\]\u{3011}\)）][ \t]*", in: stem) {
+            if let tm = firstMatch("^[\\[\u{3010}\\(（](?:单选|多选|判断|填空)[\\]\u{3011}\\)）][ \\t]*", in: stem) {
 stem = replace(stem, range: tm.range, with: "")
 .trimmingCharacters(in:.whitespacesAndNewlines)
 }
