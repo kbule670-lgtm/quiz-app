@@ -70,12 +70,12 @@ enum QuestionImporter {
             throw ImportError.badFormat("第 \(line) 行题干是空的")
         }
         let opts = options.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard opts.count == 4, opts.allSatisfy({ !$0.isEmpty }) else {
-            throw ImportError.badFormat("第 \(line) 行选项必须是 4 个非空的")
+        guard (2...4).contains(opts.count), opts.allSatisfy({ !$0.isEmpty }) else {
+            throw ImportError.badFormat("第 \(line) 行选项必须是 2 到 4 个非空的（判断题 2 个、单选题 4 个）")
         }
         let letter = answerLetter.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard let idx = ["A", "B", "C", "D"].firstIndex(of: letter) else {
-            throw ImportError.badFormat("第 \(line) 行答案必须是 A/B/C/D，写的是「\(answerLetter)」")
+        guard let idx = ["A", "B", "C", "D"].firstIndex(of: letter), idx < opts.count else {
+            throw ImportError.badFormat("第 \(line) 行答案必须是 A/B/C/D 之一且不能超出选项，写的是「\(answerLetter)」")
         }
         return QuestionDTO(stem: s, options: opts, answerIndex: idx, explanation: explanation)
     }
@@ -123,10 +123,15 @@ enum QuestionImporter {
     private static func parseBlock(_ rawBlock: String, index bi: Int) throws -> QuestionDTO {
             var block = rawBlock
 
-            // 先抠答案：答案：B / 【答案】B
+            // 先抠答案：答案：B / 【答案】B（多选会写成 答案：ABC，这种先跳过并计数）
             var answerLetter: String?
-            if let am = firstMatch(#"(?:【)?(?:答案|正确答案)(?:】)?[ \t]*[:：]?[ \t]*([ABCD])"#, in: block) {
-                answerLetter = (block as NSString).substring(with: am.range(at: 1))
+            if let am = firstMatch(#"(?:【)?(?:答案|正确答案)(?:】)?[ \t]*[:：]?[ \t]*([ABCD](?:[ \t]*[,，、和]?[ \t]*[ABCD])*)"#, in: block) {
+                let raw = (block as NSString).substring(with: am.range(at: 1))
+                let lettersOnly = raw.filter { "ABCD".contains($0) }
+                if lettersOnly.count > 1 {
+                    throw ImportError.badFormat("第 \(bi + 1) 题是多选题（答案不止一个字母），这个 App 只练单选和判断，先跳过")
+                }
+                answerLetter = lettersOnly
                 block = replace(block, range: am.range, with: "")
             }
             // 再抠解析：解析：……一直到这道题结束
@@ -146,21 +151,23 @@ enum QuestionImporter {
             guard let ans = answerLetter else {
                 throw ImportError.badFormat("第 \(bi + 1) 题没找到答案（要写「答案：B」或在题干后标（B））")
             }
-            // 抠选项：找 A. B. C. D. 四个标记，标记之间就是选项内容
+            // 抠选项：找 A. B. C. D. 标记，标记之间就是选项内容。
+            // 单选 4 个、判断 2 个（A.正确 B.错误），2 到 4 个都收，字母必须从 A 起连续。
             let optRe = try NSRegularExpression(pattern: #"([ABCD])[ \t]*[.、．:：]"#)
             let bns = block as NSString
             let opts = optRe.matches(in: block, range: NSRange(location: 0, length: bns.length))
-            guard opts.count == 4,
-                  (0..<4).allSatisfy({ bns.substring(with: opts[$0].range(at: 1)) == ["A", "B", "C", "D"][$0] })
+            let n = opts.count
+            guard (2...4).contains(n),
+                  (0..<n).allSatisfy({ bns.substring(with: opts[$0].range(at: 1)) == ["A", "B", "C", "D"][$0] })
             else {
-                throw ImportError.badFormat("第 \(bi + 1) 题没凑齐 A、B、C、D 四个选项")
+                throw ImportError.badFormat("第 \(bi + 1) 题选项没凑齐（单选要 A、B、C、D，判断要 A、B）")
             }
             let stem = bns.substring(to: opts[0].range.location)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             var options: [String] = []
-            for i in 0..<4 {
+            for i in 0..<n {
                 let s = opts[i].range.upperBound
-                let e = i + 1 < 4 ? opts[i + 1].range.location : bns.length
+                let e = i + 1 < n ? opts[i + 1].range.location : bns.length
                 options.append(bns.substring(with: NSRange(location: s, length: e - s))
                     .trimmingCharacters(in: .whitespacesAndNewlines))
             }
