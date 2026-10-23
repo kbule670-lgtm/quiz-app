@@ -59,7 +59,7 @@ struct QuizView: View {
                 Text(q.stem)
                     .font(.title3)
                     .bold()
-                ForEach(0..<4, id: \.self) { i in
+                ForEach(q.options.indices, id: \.self) { i in
                     Button { session.choose(i) } label: {
                         HStack {
                             Text(letters[i]).bold()
