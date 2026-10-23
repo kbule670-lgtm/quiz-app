@@ -1,13 +1,17 @@
 import Foundation
 import PDFKit
+import UIKit
+import Vision
 import ZIPFoundation
 
 // 从 PDF / Word 文件里先把文字抠出来，再交给 QuestionImporter 的文字解析器。
-// 只认"有文字层"的文件：扫描件/拍照的 PDF 里没有文字，抠不出来，会明确报错，
-// 不会静默导入一堆空白（那种要上 OCR，是另一个工程，v2 再说）。
+// PDF 先走文字层；没有文字层（整本都是图片，比如截图拼的题库）就走系统自带的
+// 文字识别（Vision，中文印刷体）逐页认，进度通过回调报给导入页显示。
 enum DocumentImporter {
 
-    static func fromPDF(_ data: Data) throws -> [QuestionDTO] {
+    static func fromPDF(_ data: Data,
+                        progress: @escaping (Int, Int) -> Void) async throws
+        -> (dtos: [QuestionDTO], skipped: Int) {
         guard let doc = PDFDocument(data: data) else {
             throw ImportError.badFormat("这个 PDF 打不开，可能已损坏或加了密码")
         }
@@ -18,17 +22,63 @@ enum DocumentImporter {
             }
         }
         text = stripRepeatedPageLines(text)
-        guard text.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 else {
-            throw ImportError.badFormat("这个 PDF 里读不到文字，多半是扫描/图片版；先在 WPS 里转成文字版 PDF 或 Word 再导")
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 {
+            let r = try QuestionImporter.parseFormattedText(text)
+            return (r.dtos, r.skipped.count)
         }
-        return try QuestionImporter.fromFormattedText(text)
+        // 没有文字层：整本是图片，逐页 OCR
+        let ocr = await ocrText(from: doc, progress: progress)
+        let cleaned = stripRepeatedPageLines(ocr)
+        guard cleaned.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 else {
+            throw ImportError.badFormat("这个 PDF 全是图片，自动识别也没读出文字（图片太糊的话识别不了），换个清晰点的版本再试")
+        }
+        let r = try QuestionImporter.parseFormattedText(cleaned)
+        return (r.dtos, r.skipped.count)
+    }
+
+    // 逐页把 PDF 页面渲染成图，用 Vision 认字。识别顺序按版面从上到下排。
+    private static func ocrText(from doc: PDFDocument,
+                                progress: @escaping (Int, Int) -> Void) async -> String {
+        var all = ""
+        for i in 0..<doc.pageCount {
+            defer { progress(i + 1, doc.pageCount) }
+            guard let page = doc.page(at: i) else { continue }
+            let bounds = page.bounds(for: .cropBox)
+            guard bounds.width > 1, bounds.height > 1 else { continue }
+            let scale: CGFloat = 200.0 / 72.0 // 约 200 dpi，识别更稳
+            let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+            let renderer = UIGraphicsImageRenderer(size: size)
+            let image = renderer.image { ctx in
+                UIColor.white.setFill()
+                ctx.fill(CGRect(origin: .zero, size: size))
+                let c = ctx.cgContext
+                c.translateBy(x: 0, y: size.height)
+                c.scaleBy(x: scale, y: -scale)
+                page.draw(with: .cropBox, to: c)
+            }
+            guard let cg = image.cgImage else { continue }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["zh-Hans", "en-US"]
+            request.usesLanguageCorrection = true
+            let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+            try? handler.perform([request])
+            let found = (request.results as? [VNRecognizedTextObservation]) ?? []
+            let observations = found.sorted { a, b in
+                if abs(a.boundingBox.midY - b.boundingBox.midY) > 0.008 {
+                    return a.boundingBox.midY > b.boundingBox.midY
+                }
+                return a.boundingBox.minX < b.boundingBox.minX
+            }
+            let lines = observations.compactMap { $0.topCandidates(1).first?.string }
+            all += lines.joined(separator: "\n") + "\n"
+        }
+        return all
     }
 
     // .docx 本质是个 zip 包：解开它，取 word/document.xml，把 XML 标签剥掉就是正文。
-    // （之前用 NSAttributedString.DocumentType.officeOpenXML 的写法是 macOS 独有的，
-    //   iOS SDK 里没有这个成员、编译不过，2026-10-23 第一次云端编译就是栽在这。）
     // 老版 .doc 是二进制格式、不是 zip，解不开会走到报错，提示另存为 .docx。
-    static func fromDocx(_ data: Data) throws -> [QuestionDTO] {
+    static func fromDocx(_ data: Data) throws -> (dtos: [QuestionDTO], skipped: Int) {
         guard let archive = try? Archive(data: data, accessMode: .read),
               let entry = archive["word/document.xml"]
         else {
@@ -47,7 +97,8 @@ enum DocumentImporter {
         guard text.trimmingCharacters(in: .whitespacesAndNewlines).count > 20 else {
             throw ImportError.badFormat("这个 Word 文件里没读到多少文字，检查一下文件是不是空的")
         }
-        return try QuestionImporter.fromFormattedText(text)
+        let r = try QuestionImporter.parseFormattedText(text)
+        return (r.dtos, r.skipped.count)
     }
 
     // 页眉页脚清理：同一行短文字在全书重复出现很多次（比如题库水印名），
