@@ -7,7 +7,137 @@ private struct Notice: Identifiable {
     let text: String
 }
 
-// 题库页：导入（PDF/Word/JSON/CSV/txt，三种解析方式）/ 搜索 / 按批次折叠分组 /
+// 增量插入器：一批一落盘。先 insert 再 save，save 成功后才计数并把块视为完成；
+// save 失败则把这批对象从 context 摘掉、不计数，块保持未完成（重跑时现查恢复）。
+// 去重两层，判定互斥（先检查点、再内容）：
+//   第一层 sourceKey（文件指纹+解析器版本+块后缀）——只管同版本续导；
+//   第二层 contentHash（题干+选项+答案，归一化白名单见 QuestionImporter）——
+//     同一文件指纹内跨版本防重复：解析结果没变的题靠它跳过，解析变了的题作为
+//     修正版新入（旧版留在旧批次里，不自动删）。
+// 状态只来自数据库实际记录：初始化时从当前题库现查两套集合，不另存检查点文件。
+@MainActor
+final class IncrementalInserter {
+    private let context: ModelContext
+    private let fingerprint: String
+    private let deckName: String
+    private let batch: String
+    private let now: Date
+
+    private var knownKeys: Set<String> = []
+    private var countByKey: [String: Int] = [:]
+    private var knownHashes: Set<String> = []
+    private var notedSuffixes: Set<String> = []
+
+    private(set) var ruleInserted = 0
+    private(set) var aiInserted = 0
+    private(set) var alreadySkipped = 0
+    private(set) var saveFailedCount = 0
+
+    init(context: ModelContext, questions: [Question], fingerprint: String, deckName: String) {
+        self.context = context
+        self.fingerprint = fingerprint
+        self.deckName = deckName
+        self.batch = UUID().uuidString
+        self.now = Date()
+        for q in questions {
+            guard let key = q.sourceKey, key.hasPrefix(fingerprint + "#") else { continue }
+            knownKeys.insert(key)
+            countByKey[key, default: 0] += 1
+            let hash = q.contentHash ?? QuestionImporter.contentHash(
+                stem: q.stem, options: q.options,
+                answerText: QuestionImporter.answerText(isMulti: q.isMulti,
+                                                         answerIndex: q.answerIndex,
+                                                         answerIndices: q.answerIndices))
+            knownHashes.insert(hash)
+        }
+    }
+
+    // 本文件、同解析器版本下已有的全部块后缀（服务层据此预跳过，省 AI 调用）
+    var existingSuffixes: Set<String> {
+        let prefix = "\(fingerprint)#v\(QuestionImporter.parserVersion)#"
+        return Set(knownKeys.filter { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) })
+    }
+
+    func isImported(suffix: String) -> Bool {
+        knownKeys.contains(QuestionImporter.sourceKey(fingerprint: fingerprint, suffix: suffix))
+    }
+
+    // 预跳过的后缀统一在这里计「已存在」（按现存题数计，每个后缀只计一次）
+    func noteAlreadySkipped(suffixes: [String]) {
+        for suffix in suffixes where !notedSuffixes.contains(suffix) {
+            notedSuffixes.insert(suffix)
+            let key = QuestionImporter.sourceKey(fingerprint: fingerprint, suffix: suffix)
+            alreadySkipped += countByKey[key] ?? 0
+        }
+    }
+
+    // 插入一批并立即 save。save 成功才登记键/哈希并计数；失败整批回滚、不计数。
+    @discardableResult
+    func insert(_ items: [KeyedDTO]) -> Bool {
+        var groups: [(suffix: String, items: [KeyedDTO])] = []
+        var groupIndex: [String: Int] = [:]
+        for item in items {
+            if let gi = groupIndex[item.keySuffix] {
+                groups[gi].items.append(item)
+            } else {
+                groupIndex[item.keySuffix] = groups.count
+                groups.append((item.keySuffix, [item]))
+            }
+        }
+        var insertedQuestions: [Question] = []
+        var pendingRule = 0
+        var pendingAI = 0
+        var pendingHashes: [String] = []
+        var pendingKeys: [String] = []
+        var pendingKeyCounts: [String: Int] = [:]  // 本批每键实际入几道，save 成功后并入 countByKey
+        for group in groups {
+            let key = QuestionImporter.sourceKey(fingerprint: fingerprint, suffix: group.suffix)
+            if knownKeys.contains(key) {
+                noteAlreadySkipped(suffixes: [group.suffix])
+                continue
+            }
+            var groupInserted = false
+            for item in group.items {
+                let hash = QuestionImporter.contentHash(for: item.dto)
+                if knownHashes.contains(hash) || pendingHashes.contains(hash) {
+                    alreadySkipped += 1  // 内容层命中：同一文件里这道题已存在
+                    continue
+                }
+                let q = Question(stem: item.dto.stem, options: item.dto.options,
+                                 answerIndex: item.dto.answerIndex,
+                                 explanation: item.dto.explanation, deckName: deckName,
+                                 isMulti: item.dto.isMulti,
+                                 answerIndices: item.dto.answerIndices,
+                                 batchID: batch, importedAt: now,
+                                 sourceKey: key, contentHash: hash)
+                context.insert(q)
+                insertedQuestions.append(q)
+                pendingHashes.append(hash)
+                pendingKeyCounts[key, default: 0] += 1
+                if item.origin == .ai { pendingAI += 1 } else { pendingRule += 1 }
+                groupInserted = true
+            }
+            if groupInserted { pendingKeys.append(key) }
+        }
+        guard !insertedQuestions.isEmpty else { return true }
+        do {
+            try context.save()
+        } catch {
+            for q in insertedQuestions { context.delete(q) }
+            saveFailedCount += insertedQuestions.count
+            return false
+        }
+        for k in pendingKeys { knownKeys.insert(k) }
+        for h in pendingHashes { knownHashes.insert(h) }
+        for (k, c) in pendingKeyCounts { countByKey[k, default: 0] += c }
+        ruleInserted += pendingRule
+        aiInserted += pendingAI
+        return true
+    }
+}
+
+// 题库页：导入（PDF/Word/JSON/CSV/txt，四种解析方式）/ 搜索 / 按批次折叠分组 /
 // 点题目看详情 / 示例题 / 导出 / 清空
 struct ImportView: View {
     @Environment(\.modelContext) private var context
@@ -21,13 +151,13 @@ struct ImportView: View {
     @State private var searchText = ""
     @State private var expandedBatches: Set<String> = []
 
-    // 解析方式：普通解析 / 本地 AI / 云端 AI（存 AppStorage）
-    @AppStorage("ai.mode") private var modeRaw = ImportAIMode.normal.rawValue
+    // 解析方式：智能解析（默认）/ 普通解析 / 本地 AI / 云端 AI（存 AppStorage）
+    @AppStorage("ai.mode") private var modeRaw = ImportAIMode.smart.rawValue
     @AppStorage("ai.provider") private var providerRaw = AIProvider.deepseek.rawValue
     @State private var aiKeyText = ""
     @State private var aiModelText = ""
 
-    private var aiMode: ImportAIMode { ImportAIMode(rawValue: modeRaw) ?? .normal }
+    private var aiMode: ImportAIMode { ImportAIMode(rawValue: modeRaw) ?? .smart }
     private var provider: AIProvider { AIProvider(rawValue: providerRaw) ?? .deepseek }
     private let letters = ["A", "B", "C", "D", "E"]
 
@@ -127,10 +257,9 @@ struct ImportView: View {
                 Button("清空", role: .destructive) { clearAll() }
             }
             .onAppear {
-                // 第一次打开且这台设备支持本地 AI：默认推荐本地 AI（免费、不用 key）
-                if UserDefaults.standard.object(forKey: "ai.mode") == nil,
-                   LocalAIParseService.isAvailable {
-                    modeRaw = ImportAIMode.local.rawValue
+                // 第一次打开：默认智能解析（普通解析打底 + AI 只修疑难题，两边设备都适用）
+                if UserDefaults.standard.object(forKey: "ai.mode") == nil {
+                    modeRaw = ImportAIMode.smart.rawValue
                 }
                 reloadAIFields()
             }
@@ -140,6 +269,7 @@ struct ImportView: View {
 
     private var importButtonTitle: String {
         switch aiMode {
+        case .smart: return "从文件导入题库（智能解析）"
         case .local: return "从文件导入题库（本地 AI 解析）"
         case .cloud: return "从文件导入题库（云端 AI 解析）"
         case .normal: return "从文件导入题库（PDF / Word / JSON / CSV / txt）"
@@ -188,11 +318,12 @@ struct ImportView: View {
         }
     }
 
-    // MARK: - 解析方式区（普通解析 / 本地 AI / 云端 AI 三选一）
+    // MARK: - 解析方式区（智能 / 普通 / 本地 AI / 云端 AI 四选一）
 
     private var modeSection: some View {
         Section {
             Picker("解析方式", selection: $modeRaw) {
+                Text("智能解析").tag(ImportAIMode.smart.rawValue)
                 Text("普通解析").tag(ImportAIMode.normal.rawValue)
                 if LocalAIParseService.isAvailable {
                     Text("本地 AI").tag(ImportAIMode.local.rawValue)
@@ -201,6 +332,10 @@ struct ImportView: View {
             }
             .pickerStyle(.segmented)
             switch aiMode {
+            case .smart:
+                Text("推荐：先用普通解析秒速处理绝大部分题，只有解析失败或可疑的少数题才交给 AI 修复（有本地 AI 用本地的，没有就用填了 key 的云端，都没有就如实报告剩余数量）。最快、最省，也最不容易丢题。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             case .normal:
                 Text("不用 AI，手机自己按格式抠题：最快、免费；但文件里水印多、排版乱时容易漏题。")
                     .font(.caption)
@@ -215,7 +350,7 @@ struct ImportView: View {
         } header: {
             Text("题目解析方式")
         } footer: {
-            Text("导入流程：选文件 → 自动识别文字 → 按选的方式解析 → 题目直接入库，结果会弹出计数。")
+            Text("导入流程：选文件 → 自动识别文字 → 按选的方式解析 → 题目分批直接入库（中途退出也不会丢已入库的），完成时按「普通解析 / AI / 已存在 / 未救回」四类报数。")
         }
     }
 
@@ -269,15 +404,25 @@ struct ImportView: View {
         showNotice = true
     }
 
+    private struct ImportStats {
+        var unrecovered = 0     // 最终没救回的块数
+        var notes: [String] = []
+        var debug = ""          // 失败时给用户看的诊断（切出几个题块、文字长什么样）
+    }
+
     private func handleImportURL(_ url: URL) {
         let deckName = url.deletingPathExtension().lastPathComponent
         let ext = url.pathExtension.lowercased()
+        if ext == "doc" {
+            say("老版 .doc 读不了，在 Word/WPS 里另存为 .docx 再导一次")
+            return
+        }
         let textKinds = ["pdf", "docx", "txt"]
-        // 云端 AI + 文字类文件：先查 key 和模型名，没填就别白跑一遍 OCR
+        // 云端 AI 全量 + 文字类文件：先查 key 和模型名，没填就别白跑一遍 OCR
         if aiMode == .cloud && textKinds.contains(ext) {
             if AISettings.apiKey(for: provider)
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                say("你选了云端 AI 解析，但还没填 API key。先在题库页顶上把 key 填上再导入，或者换成本地 AI / 普通解析。")
+                say("你选了云端 AI 解析，但还没填 API key。先在题库页顶上把 key 填上再导入，或者换成智能解析 / 普通解析。")
                 return
             }
             if AISettings.model(for: provider)
@@ -290,25 +435,45 @@ struct ImportView: View {
         let mode = aiMode
         let currentProvider = provider
         Task {
+            // asCopy 复制来的文件在临时目录，一般不用权限；保险起见试一下，有就用完释放
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
-                let result = try await Self.load(from: url, mode: mode,
-                                                 provider: currentProvider) { status in
+                let data = try Data(contentsOf: url)
+                let fingerprint = QuestionImporter.sha256Hex(data)
+                // 插入器从数据库实际记录现查去重集合（不依赖任何缓存的检查点）
+                let inserter = IncrementalInserter(context: context, questions: questions,
+                                                   fingerprint: fingerprint, deckName: deckName)
+                let stats = try await Self.load(data: data, ext: ext, mode: mode,
+                                                provider: currentProvider,
+                                                inserter: inserter) { status in
                     DispatchQueue.main.async { importStatus = status }
                 }
                 importStatus = nil
-                guard !result.dtos.isEmpty else {
+                let newCount = inserter.ruleInserted + inserter.aiInserted
+                if newCount == 0 && inserter.alreadySkipped == 0 {
                     var msg = "文件里没有读到题目"
-                    if !result.debug.isEmpty { msg += "\n" + result.debug }
+                    if stats.unrecovered > 0 {
+                        msg += "\n有 \(stats.unrecovered) 块内容没能解析出来"
+                    }
+                    if !stats.debug.isEmpty { msg += "\n" + stats.debug }
                     say(msg)
                     return
                 }
-                insert(result.dtos, deckName: deckName)
-                var msg = "导入成功：\(result.dtos.count) 道题"
-                if result.skipped > 0 {
-                    msg += "\n另有 \(result.skipped) 道没认出来，已跳过（多半是排版或图片识别的问题）"
+                // 四分统计，互斥对账：新入（普通/AI）+ 已存在跳过 + 未救回
+                var lines = ["导入完成",
+                             "普通解析新入 \(inserter.ruleInserted) 道 · AI 新入 \(inserter.aiInserted) 道"]
+                if inserter.alreadySkipped > 0 {
+                    lines.append("已存在跳过 \(inserter.alreadySkipped) 道（同一文件之前导过，没重复入库）")
                 }
-                if !result.note.isEmpty { msg += "\n" + result.note }
-                say(msg)
+                if stats.unrecovered > 0 {
+                    lines.append("未救回 \(stats.unrecovered) 块（解析不出来、AI 也没修好）")
+                }
+                if inserter.saveFailedCount > 0 {
+                    lines.append("另有 \(inserter.saveFailedCount) 道保存失败，下次导入同一文件会自动补上")
+                }
+                lines.append(contentsOf: stats.notes)
+                say(lines.joined(separator: "\n"))
             } catch {
                 importStatus = nil
                 say("导入失败：\(error.localizedDescription)")
@@ -316,91 +481,243 @@ struct ImportView: View {
         }
     }
 
-    private struct LoadOutcome {
-        var dtos: [QuestionDTO]
-        var skipped: Int
-        var debug: String  // 失败时给用户看的诊断（切出几个题块、文字长什么样）
-        var note: String   // 成功时附带的一句说明（如 AI 有几段回退了本地解析）
-    }
-
-    // 实际读文件+解析。PDF 图片版会先逐页 OCR（慢，放后台跑）；
-    // 解析方式三选一：普通解析走本地正则；本地/云端 AI 逐段结构化，某段失败自动回退普通解析。
-    private static func load(from url: URL, mode: ImportAIMode, provider: AIProvider,
-                             status: @escaping (String) -> Void) async throws -> LoadOutcome {
-        // asCopy 复制来的文件在临时目录，一般不用权限；保险起见试一下，有就用完释放
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let ext = url.pathExtension.lowercased()
+    // 实际读文件+解析+分批入库。PDF 图片版会先逐页 OCR（慢，放后台跑）。
+    private static func load(data: Data, ext: String, mode: ImportAIMode,
+                             provider: AIProvider, inserter: IncrementalInserter,
+                             status: @escaping (String) -> Void) async throws -> ImportStats {
         switch ext {
         case "csv":
-            let text = try String(contentsOf: url, encoding: .utf8)
-            return LoadOutcome(dtos: try QuestionImporter.fromCSV(text),
-                               skipped: 0, debug: "", note: "")
-        case "doc":
-            throw ImportError.badFormat("老版 .doc 读不了，在 Word/WPS 里另存为 .docx 再导一次")
+            let text = String(data: data, encoding: .utf8) ?? ""
+            let dtos = try QuestionImporter.fromCSV(text)
+            await insertBatched(dtos.enumerated().map {
+                KeyedDTO(dto: $0.element, keySuffix: "j\($0.offset)", origin: .rule)
+            }, inserter: inserter)
+            return ImportStats()
         case "pdf", "docx", "txt":
             let text: String
             if ext == "pdf" {
-                text = try await DocumentImporter.pdfText(try Data(contentsOf: url)) { cur, total in
+                text = try await DocumentImporter.pdfText(data) { cur, total in
                     status("这份 PDF 是图片版的，正在逐页识别文字：第 \(cur)/\(total) 页，耐心等一下")
                 }
             } else if ext == "docx" {
-                text = try DocumentImporter.docxText(try Data(contentsOf: url))
+                text = try DocumentImporter.docxText(data)
             } else {
-                text = try String(contentsOf: url, encoding: .utf8)
+                text = String(data: data, encoding: .utf8) ?? ""
             }
             switch mode {
             case .cloud:
-                let outcome = try await AIParseService.parse(text: text, provider: provider) { cur, total in
-                    status("云端 AI 解析中 第 \(cur)/\(total) 段")
-                }
-                var note = ""
-                if outcome.fallbackChunks > 0 {
-                    note = "其中 \(outcome.fallbackChunks)/\(outcome.totalChunks) 段 AI 没成功，已用普通解析顶上"
-                }
-                return LoadOutcome(dtos: outcome.dtos, skipped: outcome.skipped,
-                                   debug: "", note: note)
+                return try await loadCloud(text: text, provider: provider,
+                                           inserter: inserter, status: status)
             case .local where LocalAIParseService.isAvailable:
-                let outcome = try await LocalAIParseService.parse(text: text) { cur, total in
-                    status("本地 AI 解析中 第 \(cur)/\(total) 段")
-                }
-                var note = ""
-                if outcome.fallbackChunks > 0 {
-                    note = "其中 \(outcome.fallbackChunks)/\(outcome.totalChunks) 段本地 AI 没成功，已用普通解析顶上"
-                }
-                return LoadOutcome(dtos: outcome.dtos, skipped: outcome.skipped,
-                                   debug: "", note: note)
+                return try await loadLocal(text: text, inserter: inserter, status: status)
+            case .smart:
+                return await loadSmart(text: text, provider: provider,
+                                       inserter: inserter, status: status)
             default:
                 // 普通解析；选了本地 AI 但设备忽然不可用时也落到这里
-                let r = try QuestionImporter.parseFormattedText(text)
-                let preview = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
-                return LoadOutcome(dtos: r.dtos, skipped: r.skipped.count,
-                                   debug: "切出 \(r.blocks) 个题块。识别到的文字开头：\(preview)",
-                                   note: mode == .local ? "本地 AI 这次不可用，已用普通解析导入" : "")
+                return await loadNormal(text: text, inserter: inserter, mode: mode)
             }
         default:
-            let data = try Data(contentsOf: url)
-            return LoadOutcome(dtos: try QuestionImporter.fromJSON(data),
-                               skipped: 0, debug: "", note: "")
+            let dtos = try QuestionImporter.fromJSON(data)
+            await insertBatched(dtos.enumerated().map {
+                KeyedDTO(dto: $0.element, keySuffix: "j\($0.offset)", origin: .rule)
+            }, inserter: inserter)
+            return ImportStats()
         }
     }
 
-    private func insert(_ dtos: [QuestionDTO], deckName: String) {
+    // 每约 40 道一批落盘（仅用于逐题后缀互不相同的路径：普通/智能主流程、JSON、CSV）
+    private static func insertBatched(_ items: [KeyedDTO], inserter: IncrementalInserter) async {
+        let size = 40
+        guard items.count > size else {
+            if !items.isEmpty { await inserter.insert(items) }
+            return
+        }
+        for i in stride(from: 0, to: items.count, by: size) {
+            await inserter.insert(Array(items[i..<min(i + size, items.count)]))
+        }
+    }
+
+    private static func loadNormal(text: String, inserter: IncrementalInserter,
+                                   mode: ImportAIMode) async -> ImportStats {
+        let r = QuestionImporter.parseDetailed(text)
+        var stats = ImportStats()
+        var pending: [KeyedDTO] = []
+        for item in r.items {
+            let suffix = "b\(item.blockIndex)"
+            if await inserter.isImported(suffix: suffix) {
+                await inserter.noteAlreadySkipped(suffixes: [suffix])
+                continue
+            }
+            pending.append(KeyedDTO(dto: item.dto, keySuffix: suffix, origin: .rule))
+        }
+        await insertBatched(pending, inserter: inserter)
+        var unrecovered = 0
+        for sk in r.skipped {
+            let suffix = "b\(sk.index)"
+            if await inserter.isImported(suffix: suffix) {
+                await inserter.noteAlreadySkipped(suffixes: [suffix])
+            } else {
+                unrecovered += 1
+            }
+        }
+        stats.unrecovered = unrecovered
+        let preview = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
+        stats.debug = "切出 \(r.blocks.count) 个题块。识别到的文字开头：\(preview)"
+        if mode == .local {
+            stats.notes.append("本地 AI 这次不可用，已用普通解析导入")
+        }
+        return stats
+    }
+
+    private static func loadCloud(text: String, provider: AIProvider,
+                                  inserter: IncrementalInserter,
+                                  status: @escaping (String) -> Void) async throws -> ImportStats {
+        let suffixes = await inserter.existingSuffixes
+        let outcome = try await AIParseService.parse(
+            text: text, provider: provider, existingSuffixes: suffixes,
+            onChunk: { keyed in await inserter.insert(keyed) },
+            progress: { cur, total in status("云端 AI 解析中 第 \(cur)/\(total) 段") })
+        await inserter.noteAlreadySkipped(suffixes: outcome.skippedExistingSuffixes)
+        var stats = ImportStats()
+        stats.unrecovered = outcome.skipped
+        if outcome.totalChunks > 0 {
+            stats.notes.append("云端 AI 成功 \(outcome.aiSuccessChunks)/\(outcome.totalChunks) 段"
+                + (outcome.fallbackChunks > 0 ? "，\(outcome.fallbackChunks) 段回退了普通解析" : ""))
+        }
+        return stats
+    }
+
+    private static func loadLocal(text: String, inserter: IncrementalInserter,
+                                  status: @escaping (String) -> Void) async throws -> ImportStats {
+        let suffixes = await inserter.existingSuffixes
+        let outcome = try await LocalAIParseService.parse(
+            text: text, existingSuffixes: suffixes,
+            onChunk: { keyed in await inserter.insert(keyed) },
+            progress: { cur, total in status("本地 AI 解析中 第 \(cur)/\(total) 段") })
+        await inserter.noteAlreadySkipped(suffixes: outcome.skippedExistingSuffixes)
+        var stats = ImportStats()
+        stats.unrecovered = outcome.skipped
+        if outcome.totalChunks > 0 {
+            stats.notes.append("本地 AI 成功 \(outcome.aiSuccessChunks)/\(outcome.totalChunks) 段"
+                + (outcome.fallbackChunks > 0 ? "，\(outcome.fallbackChunks) 段回退了普通解析" : ""))
+        }
+        return stats
+    }
+
+    // 智能解析：普通解析全量先行 → 失败块/可疑块进 AI 修复队列 → 修不好如实计数
+    private static func loadSmart(text: String, provider: AIProvider,
+                                  inserter: IncrementalInserter,
+                                  status: @escaping (String) -> Void) async -> ImportStats {
+        var stats = ImportStats()
+        let r = QuestionImporter.parseDetailed(text)
+        let byIndex = Dictionary(uniqueKeysWithValues: r.blocks.map { ($0.index, $0) })
+
+        // 第一阶段：普通解析。正常题分批入库；可疑题先扣下等 AI 复核
+        var pending: [KeyedDTO] = []
+        var suspectItems: [ParsedItem] = []
+        for item in r.items {
+            let suffix = "b\(item.blockIndex)"
+            if await inserter.isImported(suffix: suffix) {
+                await inserter.noteAlreadySkipped(suffixes: [suffix])
+                continue
+            }
+            if item.suspect {
+                suspectItems.append(item)
+            } else {
+                pending.append(KeyedDTO(dto: item.dto, keySuffix: suffix, origin: .rule))
+            }
+        }
+        await insertBatched(pending, inserter: inserter)
+        status("普通解析完成：新入 \(await inserter.ruleInserted) 道，正在处理疑难题…")
+
+        // 修复队列：解析失败块 + 可疑块（已被检查点命中的不进队列）
+        var skippedQueue: [RawBlock] = []
+        var unrecovered = 0
+        for sk in r.skipped {
+            let suffix = "b\(sk.index)"
+            if await inserter.isImported(suffix: suffix) {
+                await inserter.noteAlreadySkipped(suffixes: [suffix])
+            } else if let block = byIndex[sk.index] {
+                skippedQueue.append(block)
+            } else {
+                unrecovered += 1
+            }
+        }
+        var suspectQueue: [(item: ParsedItem, block: RawBlock)] = []
+        for item in suspectItems {
+            if let block = byIndex[item.blockIndex] {
+                suspectQueue.append((item, block))
+            }
+        }
+        let queueCount = skippedQueue.count + suspectQueue.count
+        guard queueCount > 0 else {
+            stats.unrecovered = unrecovered
+            return stats
+        }
+
+        let repairer = AIRepairer.autoSelect(provider: provider)
+        stats.notes.append("智能解析：\(queueCount) 块疑难题交给 \(repairer.displayName) 修复")
+        switch repairer {
+        case .none:
+            unrecovered += skippedQueue.count
+            if !suspectQueue.isEmpty {
+                await insertBatched(suspectQueue.map {
+                    KeyedDTO(dto: $0.item.dto, keySuffix: "b\($0.item.blockIndex)", origin: .rule)
+                }, inserter: inserter)
+                stats.notes.append("没有可用的 AI 修复，\(suspectQueue.count) 道可疑题已按普通解析结果原样入库")
+            }
+        case .local, .cloud:
+            let blocks = skippedQueue + suspectQueue.map { $0.block }
+            var failed = Set(blocks.map { $0.index })
+            var repairedCount = 0
+            do {
+                let outcome: AIParseService.RepairOutcome
+                if case .local = repairer {
+                    outcome = try await LocalAIParseService.repair(
+                        blocks: blocks,
+                        onChunk: { keyed in await inserter.insert(keyed) },
+                        progress: { cur, total in status("AI 修复中（本地 AI）第 \(cur)/\(total) 块") })
+                } else {
+                    outcome = try await AIParseService.repair(
+                        blocks: blocks, provider: provider,
+                        onChunk: { keyed in await inserter.insert(keyed) },
+                        progress: { cur, total in status("AI 修复中（云端）第 \(cur)/\(total) 组") })
+                }
+                failed = Set(outcome.failedBlocks)
+                repairedCount = outcome.repairedBlocks.count
+            } catch {
+                stats.notes.append("AI 修复没跑起来：\(error.localizedDescription)")
+            }
+            unrecovered += skippedQueue.filter { failed.contains($0.index) }.count
+            // 可疑块修失败的回退普通解析结果入库（已通过校验，别丢）
+            let fallenSuspects = suspectQueue.filter { failed.contains($0.item.blockIndex) }
+            if !fallenSuspects.isEmpty {
+                await insertBatched(fallenSuspects.map {
+                    KeyedDTO(dto: $0.item.dto, keySuffix: "b\($0.item.blockIndex)", origin: .rule)
+                }, inserter: inserter)
+                stats.notes.append("\(fallenSuspects.count) 道可疑题 AI 没修成，已按普通解析结果入库")
+            }
+            if repairedCount > 0 {
+                stats.notes.append("AI 成功修复 \(repairedCount) 块")
+            }
+        }
+        stats.unrecovered = unrecovered
+        return stats
+    }
+
+    private func loadSample() {
         // 一次导入 = 一个批次，题库页按这个折叠分组
         let batch = UUID().uuidString
         let now = Date()
-        for d in dtos {
+        for d in SampleBank.questions {
             context.insert(Question(stem: d.stem, options: d.options,
                                     answerIndex: d.answerIndex,
-                                    explanation: d.explanation, deckName: deckName,
+                                    explanation: d.explanation, deckName: "示例题库",
                                     isMulti: d.isMulti, answerIndices: d.answerIndices,
                                     batchID: batch, importedAt: now))
         }
         try? context.save()
-    }
-
-    private func loadSample() {
-        insert(SampleBank.questions, deckName: "示例题库")
         say("已载入 \(SampleBank.questions.count) 道示例题，可以先跑通全流程")
     }
 
