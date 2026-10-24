@@ -18,7 +18,7 @@ targets:
     info:
       path: QuizApp/Info.plist
       properties:
-        CFBundleDisplayName: 刷题
+        CFBundleDisplayName: 277定制专用app
         UILaunchStoryboardName: ""
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -38,7 +38,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kabule.quizapp
-        CFBundleDisplayName: 刷题
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CFBundleDisplayName: 277定制专用app
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
         CODE_SIGNING_ALLOWED: NO
