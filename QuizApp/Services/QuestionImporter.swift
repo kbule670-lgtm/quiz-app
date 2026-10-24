@@ -37,7 +37,10 @@ struct RawBlock {
 // 解析成功的题（带回块定位与疑似标记）
 struct ParsedItem {
     var dto: QuestionDTO
-    var blockIndex: Int
+    var blockIndex: Int          // 块序号（0 起，用于 sourceKey 后缀；不是题号）
+    var number: Int? = nil       // 题号标记里的数字（劈开第二部分无标记，为 nil）
+    var subIndex: Int = 0   // 同块内启发式劈开后的第二部分为 1，正常题为 0；
+                            // 拼 sourceKey 后缀时用 "b<块号>" 或 "b<块号>s<subIndex>"
     var suspect: Bool       // 通过校验但可疑（题干过短/疑似粘连残留），智能模式会送 AI 复核
     var suspectReason: String
 }
@@ -60,9 +63,10 @@ struct ParseResult {
 enum QuestionImporter {
 
     // 解析器版本：切题/解析逻辑任何改动必须 +1。
-    // sourceKey = 文件指纹 + 版本 + 块序号，只在同版本内做续导/去重；
+    // sourceKey = 文件指纹 + 版本 + 块后缀，只在同版本内做续导/去重；
     // 版本变了不沿用旧检查点，靠内容哈希层防重复（见 ImportView 的插入器）。
-    static let parserVersion = 2
+    // v3（8.ipa）：选项标记容错（字母后无分隔符也认）+ 无标记粘连启发式劈开。
+    static let parserVersion = 3
 
     static func sourceKey(fingerprint: String, suffix: String) -> String {
         "\(fingerprint)#v\(parserVersion)#\(suffix)"
@@ -454,6 +458,39 @@ enum QuestionImporter {
         out.append((start, markerEnd, end, number, hint, score))
     }
 
+    // 诊断用：文本里题号候选的数字集合（未评分筛选，仅作题号归因的 OCR 侧集合；
+    // 1900–2099 的年份引用除外——与评分里的年份扣分口径一致）。
+    static func markerNumbers(in rawText: String) -> Set<Int> {
+        let text = normalize(rawText)
+        let ns = text as NSString
+        guard let re = try? NSRegularExpression(pattern: candidatePattern) else { return [] }
+        var out: Set<Int> = []
+        for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            for gi in [1, 3, 5, 6, 8, 9, 11] {
+                let r = m.range(at: gi)
+                // 题号 ≥1：与切题评分里的「题号 0 误切」护栏同口径，0 号候选不算题
+                if r.location != NSNotFound, let n = Int(ns.substring(with: r)),
+                   n >= 1, !(1900...2099).contains(n) {
+                    out.insert(n)
+                }
+            }
+        }
+        return out
+    }
+
+    // 诊断用：文本里题号候选标记的个数（不评分、不筛阈值），供导入诊断 A/C 段计数
+    static func markerCount(in rawText: String) -> Int {
+        let text = normalize(rawText)
+        let ns = text as NSString
+        guard let re = try? NSRegularExpression(pattern: candidatePattern) else { return 0 }
+        return re.numberOfMatches(in: text, range: NSRange(location: 0, length: ns.length))
+    }
+
+    // ParsedItem 的 sourceKey 后缀：正常题 b<块号>，劈开后的第二部分 b<块号>s<subIndex>
+    static func keySuffix(for item: ParsedItem) -> String {
+        item.subIndex > 0 ? "b\(item.blockIndex)s\(item.subIndex)" : "b\(item.blockIndex)"
+    }
+
     // 某段文本里是否还嵌着题目标记（给已解析题做粘连残留嫌疑判定用）
     static func containsEmbeddedMarker(_ text: String) -> Bool {
         let ns = text as NSString
@@ -490,21 +527,9 @@ enum QuestionImporter {
         for b in blocks {
             do {
                 let dto = try parseBlock(bodies[b.index], index: b.index, typeHint: b.typeHint)
-                var suspect = false
-                var reason = ""
-                if dto.stem.count < 4 {
-                    suspect = true; reason = "题干异常短"
-                }
-                if !suspect && dto.options.contains(where: {
-                    containsEmbeddedMarker($0) || $0.contains("答案：") || $0.contains("答案:")
-                }) {
-                    suspect = true; reason = "选项里疑似混入了下一题的内容"
-                }
-                if !suspect && countAnswerLines(bodies[b.index]) >= 2 {
-                    suspect = true; reason = "一块里有多个答案行，疑似两题粘连"
-                }
-                items.append(ParsedItem(dto: dto, blockIndex: b.index,
-                                        suspect: suspect, suspectReason: reason))
+                let reason = suspectReason(for: dto, body: bodies[b.index])
+                items.append(ParsedItem(dto: dto, blockIndex: b.index, number: b.number,
+                                        suspect: reason != nil, suspectReason: reason ?? ""))
             } catch let e as ImportError {
                 skipped.append(SkippedBlock(index: b.index, number: b.number,
                                             raw: b.raw, reason: e.errorDescription ?? "解析失败"))
@@ -513,7 +538,101 @@ enum QuestionImporter {
                                             raw: b.raw, reason: "解析失败"))
             }
         }
-        return ParseResult(items: items, skipped: skipped, blocks: blocks)
+        // 无标记粘连启发式劈开（157/351/440 类）：只对粘连嫌疑块触发。
+        // 劈得开 → 一块变两题；劈不开 → 原样保留嫌疑（智能模式送 AI），禁止强行入库。
+        var finalItems: [ParsedItem] = []
+        for item in items {
+            if item.suspect
+                && (item.suspectReason == "一块里有多个答案行，疑似两题粘连"
+                    || item.suspectReason == "选项里疑似混入了下一题的内容"),
+               let hint = blocks[item.blockIndex].typeHint,
+               let (first, second) = trySplitUnmarked(bodies[item.blockIndex],
+                                                       index: item.blockIndex,
+                                                       parentNumber: blocks[item.blockIndex].number,
+                                                       typeHint: hint) {
+                finalItems.append(first)
+                finalItems.append(second)
+            } else {
+                finalItems.append(item)
+            }
+        }
+        return ParseResult(items: finalItems, skipped: skipped, blocks: blocks)
+    }
+
+    // 与 parseDetailed 同口径的嫌疑判定（抽出来供劈开后两侧复用）
+    private static func suspectReason(for dto: QuestionDTO, body: String) -> String? {
+        if dto.stem.count < 4 { return "题干异常短" }
+        if dto.options.contains(where: {
+            containsEmbeddedMarker($0) || $0.contains("答案：") || $0.contains("答案:")
+        }) { return "选项里疑似混入了下一题的内容" }
+        if countAnswerLines(body) >= 2 { return "一块里有多个答案行，疑似两题粘连" }
+        return nil
+    }
+
+    // 无标记粘连启发式劈开：块内 ≥2 个答案行时，尝试把第二题劈出来。
+    // 约束：劈分点必须落在疑似新题的题干起点；第二部分必须具备完整选项集（A–D 齐全）
+    // 与答案行；两侧各自重新走完整校验，任一侧通不过即放弃劈分、原样保留。
+    private static func trySplitUnmarked(_ body: String, index bi: Int,
+                                         parentNumber: Int?,
+                                         typeHint: String?) -> (ParsedItem, ParsedItem)? {
+        guard let re = try? NSRegularExpression(
+            pattern: "(?:答案|正确答案)[ \\t]*[:：][^\\n]*") else { return nil }
+        let ns = body as NSString
+        let matches = re.matches(in: body, range: NSRange(location: 0, length: ns.length))
+        guard matches.count >= 2 else { return nil }
+        // 第二题题干起点：第一个答案行之后第一个非空行行首（跳过空行与页眉残行）
+        let firstEnd = matches[0].range.upperBound
+        let rest = ns.substring(from: firstEnd)
+        var offset = firstEnd
+        var stemStart: Int? = nil
+        for line in rest.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { offset += line.count + 1; continue }
+            if trimmed.count <= 12 && (trimmed.contains("题库") || trimmed.contains("小程序")) {
+                offset += line.count + 1; continue
+            }
+            stemStart = offset
+            break
+        }
+        guard let stemStart = stemStart, stemStart < ns.length else { return nil }
+        let firstPart = ns.substring(to: stemStart)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let secondPart = ns.substring(from: stemStart)
+        guard hasFullOptionSet(secondPart), countAnswerLines(secondPart) >= 1 else { return nil }
+        do {
+            let dto1 = try parseBlock(firstPart, index: bi, typeHint: typeHint)
+            let dto2 = try parseBlock(secondPart, index: bi, typeHint: nil)
+            let s1 = suspectReason(for: dto1, body: firstPart)
+            let s2 = suspectReason(for: dto2, body: secondPart)
+            // 第二部分仍可疑（比如还粘着第三题）→ 放弃劈分，原样保留
+            guard s2 == nil else { return nil }
+            // item1 沿用父块题号；item2 是无标记题，没有题号（归因时不进题号集）
+            let item1 = ParsedItem(dto: dto1, blockIndex: bi, number: parentNumber, subIndex: 0,
+                                   suspect: s1 != nil, suspectReason: s1 ?? "")
+            let item2 = ParsedItem(dto: dto2, blockIndex: bi, number: nil, subIndex: 1,
+                                   suspect: false, suspectReason: "")
+            return (item1, item2)
+        } catch {
+            return nil
+        }
+    }
+
+    // 文本里是否有一套完整的 A–D 选项标记（分隔符形式，按序出现）
+    private static func hasFullOptionSet(_ text: String) -> Bool {
+        guard let re = try? NSRegularExpression(pattern: #"([ABCDE])[ \t]*[.、．:：]"#) else {
+            return false
+        }
+        let ns = text as NSString
+        let ms = re.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        var next = 0
+        for m in ms {
+            let letter = ns.substring(with: m.range(at: 1))
+            if letter == allLetters[next] {
+                next += 1
+                if next >= 4 { return true }
+            }
+        }
+        return false
     }
 
     private static func countAnswerLines(_ body: String) -> Int {
@@ -598,14 +717,12 @@ enum QuestionImporter {
         // 5) 抠选项：找 A. B. C. D. E. 标记，标记之间就是选项内容。
         // 理想情况字母从 A 起严格连续；OCR 串行时可能多出重复/乱序标记，
         // 这时贪心只收「下一个该出现的字母」，把串掉的标记丢掉，别整道扔。
-        let optRe = try NSRegularExpression(pattern: #"([ABCDE])[ \t]*[.、．:：]"#)
+        // 8.ipa 容错：分隔符形式凑不够 2 个时，第二遍并入行首「字母+汉字」
+        // 无分隔符形式（如 OCR 吞了分隔符的 A制度创新）。防误伤规则：合并后若
+        // 有任何分隔符标记被贪心跳过且落在已收标记之间，说明无分隔符标记与高
+        // 置信标记冲突（如题干里的 A股行），直接退回分隔符结果，宁可进修复队列。
         let bns = block as NSString
-        let allOpts = optRe.matches(in: block, range: NSRange(location: 0, length: bns.length))
-        var opts: [NSTextCheckingResult] = []
-        for m in allOpts {
-            let letter = bns.substring(with: m.range(at: 1))
-            if letter == allLetters[opts.count] { opts.append(m) }
-        }
+        let opts = optionMarkers(in: block, bns: bns)
         let n = opts.count
         guard (2...5).contains(n) else {
             throw ImportError.badFormat("第 \(bi + 1) 题选项没凑齐（单选要 A、B、C、D，多选可到 E，判断要 A、B）")
@@ -651,6 +768,47 @@ enum QuestionImporter {
         let single = answerLetters.first ?? judgeAnswerLetter ?? ""
         return try dto(stem: stem, options: options, answerLetter: single,
                        explanation: explanation, line: bi + 1)
+    }
+
+    // 选项标记两遍扫描（见 parseBlock 第 5 步注释）
+    private static func optionMarkers(in block: String, bns: NSString) -> [NSTextCheckingResult] {
+        let full = NSRange(location: 0, length: bns.length)
+        guard let sepRe = try? NSRegularExpression(pattern: #"([ABCDE])[ \t]*[.、．:：]"#) else {
+            return []
+        }
+        let sep = sepRe.matches(in: block, range: full)
+        var sepGreedy: [NSTextCheckingResult] = []
+        for m in sep {
+            let letter = bns.substring(with: m.range(at: 1))
+            if letter == allLetters[sepGreedy.count] { sepGreedy.append(m) }
+        }
+        if sepGreedy.count >= 2 { return sepGreedy }
+        // 第二遍：行首「字母+汉字」无分隔符形式
+        guard let bareRe = try? NSRegularExpression(
+            pattern: "(?m)^[ \\t]*([ABCDE])(?=[\\u4e00-\\u9fff])") else { return sepGreedy }
+        let bare = bareRe.matches(in: block, range: full)
+        var all = sep + bare
+        all.sort { $0.range.location < $1.range.location }
+        var merged: [NSTextCheckingResult] = []
+        var rejectedSep: [NSTextCheckingResult] = []
+        for m in all {
+            let letter = bns.substring(with: m.range(at: 1))
+            if letter == allLetters[merged.count] {
+                merged.append(m)
+            } else if sep.contains(where: { $0.range.location == m.range.location }) {
+                rejectedSep.append(m)
+            }
+        }
+        // 合并结果与高置信分隔符标记冲突 → 退回分隔符结果（宁可进修复队列）
+        if merged.count >= 2,
+           let first = merged.first, let last = merged.last,
+           !rejectedSep.contains(where: {
+               $0.range.location > first.range.location
+                   && $0.range.location < last.range.location
+           }) {
+            return merged
+        }
+        return sepGreedy
     }
 
     // 判断题选项文字归一：对/√→正确，错/×→错误，其余原样返回

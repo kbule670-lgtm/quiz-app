@@ -434,19 +434,19 @@ enum AIParseService {
         guard let url = URL(string: provider.baseURL + "/chat/completions") else {
             throw AIError.badResponse("接口地址不对")
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 180
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONEncoder().encode(ChatRequest(
+        let body = try JSONEncoder().encode(ChatRequest(
             model: model,
             messages: [ChatRequest.Message(role: "user", content: prompt)],
             temperature: 0.1))
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw AIError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        // 8.ipa：云端请求走后台会话（切后台/锁屏后传输由系统继续跑完，结果按段落库）。
+        // 后台传输失败时错误原样上抛，由并发执行器按原口径重试，不静默改走前台会话
+        // （避免一次请求发两遍、重试计数失真）。
+        let (data, status) = try await BackgroundAIClient.shared.post(
+            url: url, body: body,
+            headers: ["Content-Type": "application/json",
+                      "Authorization": "Bearer \(apiKey)"])
+        if status != 200 {
+            throw AIError.http(status, String(data: data, encoding: .utf8) ?? "")
         }
         let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
         guard let content = decoded.choices.first?.message.content else {
