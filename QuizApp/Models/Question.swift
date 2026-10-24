@@ -16,6 +16,12 @@ final class Question {
     var isMulti: Bool       // 多选题（答案不止一个）
     var answerIndices: [Int] // 多选题的正确答案集合（单选时为空，用 answerIndex）
     var isFavorite: Bool    // 收藏夹
+    // 导入溯源（7 版加，均为可选、老数据 nil，不触发重量级迁移）：
+    // sourceKey = 文件指纹#v<解析器版本>#<块后缀>，同版本内续导/去重用；
+    // contentHash = 题干+选项+答案的内容哈希（归一化规则见 QuestionImporter），
+    // 解析器升级后靠它跨版本防重复。两者都以数据库实际记录为准，不另存检查点。
+    var sourceKey: String? = nil
+    var contentHash: String? = nil
 
     // 刷题统计
     var totalAttempts: Int   // 刷过几次
@@ -43,7 +49,8 @@ final class Question {
     init(stem: String, options: [String], answerIndex: Int,
          explanation: String = "", deckName: String = "默认题库",
          isMulti: Bool = false, answerIndices: [Int] = [],
-         batchID: String? = nil, importedAt: Date? = nil) {
+         batchID: String? = nil, importedAt: Date? = nil,
+         sourceKey: String? = nil, contentHash: String? = nil) {
         self.id = UUID()
         self.stem = stem
         self.options = options
@@ -55,6 +62,8 @@ final class Question {
         self.isMulti = isMulti
         self.answerIndices = answerIndices
         self.isFavorite = false
+        self.sourceKey = sourceKey
+        self.contentHash = contentHash
         self.totalAttempts = 0
         self.correctAttempts = 0
         self.wrongCount = 0
